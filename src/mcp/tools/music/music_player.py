@@ -13,6 +13,7 @@ import ctypes.wintypes
 import os
 import platform
 import subprocess
+import time
 from typing import Optional
 
 from src.utils.config_manager import ConfigManager
@@ -170,11 +171,13 @@ class MusicPlayer:
             logger.info(f"Opened URI: {uri}")
         except OSError:
             # orpheus:// not registered, fall back to web player
-            if uri.startswith("orpheus://song/"):
-                song_id = uri.split("/")[-1]
+            # Strip query params for ID extraction
+            base_uri = uri.split("?")[0].rstrip("/")
+            if "song" in uri:
+                song_id = base_uri.split("/")[-1]
                 web_url = f"https://music.163.com/#/song?id={song_id}"
-            elif uri.startswith("orpheus://playlist/"):
-                playlist_id = uri.split("/")[-1]
+            elif "playlist" in uri:
+                playlist_id = base_uri.split("/")[-1]
                 web_url = f"https://music.163.com/#/playlist?id={playlist_id}"
             else:
                 logger.error(f"Failed to open URI: {uri}")
@@ -383,6 +386,98 @@ class MusicPlayer:
             return None
 
     # ------------------------------------------------------------------
+    # Window-level control (pywin32)
+    # ------------------------------------------------------------------
+
+    def _find_netease_hwnd(self) -> Optional[int]:
+        """Find the main window handle of NetEase Cloud Music.
+
+        Enumerates all windows, matches by cloudmusic.exe process.
+        Returns the hwnd of the largest visible window (main window).
+        """
+        if platform.system() != "Windows":
+            return None
+        try:
+            import win32gui
+            import win32process
+
+            # Get PIDs for cloudmusic.exe
+            result = subprocess.run(
+                [
+                    "tasklist", "/FI",
+                    f"IMAGENAME eq {NETEASE_PROCESS_NAME}",
+                    "/FO", "CSV", "/NH",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+
+            netease_pids = set()
+            for line in result.stdout.strip().split("\n"):
+                parts = line.strip('"').split('","')
+                if len(parts) >= 2:
+                    try:
+                        netease_pids.add(int(parts[1]))
+                    except ValueError:
+                        pass
+
+            if not netease_pids:
+                return None
+
+            # Find the main window (visible, has title, belongs to cloudmusic)
+            best_hwnd = None
+            best_title_len = 0
+
+            def _enum_callback(hwnd, _):
+                nonlocal best_hwnd, best_title_len
+                if not win32gui.IsWindowVisible(hwnd):
+                    return True
+                _, pid = win32process.GetWindowThreadProcessId(hwnd)
+                if pid not in netease_pids:
+                    return True
+                title = win32gui.GetWindowText(hwnd)
+                # Prefer the window with the longest title (main window)
+                if title and len(title) > best_title_len:
+                    best_title_len = len(title)
+                    best_hwnd = hwnd
+                return True
+
+            win32gui.EnumWindows(_enum_callback, None)
+            return best_hwnd
+
+        except Exception as e:
+            logger.debug(f"Failed to find NetEase window: {e}")
+            return None
+
+    def _activate_and_play(self, hwnd: int):
+        """Activate the NetEase window and send play command.
+
+        Brings the window to foreground, then sends Space key to trigger
+        playback on the song detail page.
+        """
+        try:
+            import win32gui
+            import win32con
+
+            # Bring window to foreground
+            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+            win32gui.SetForegroundWindow(hwnd)
+            time.sleep(0.5)
+
+            # Send Space key to trigger play
+            win32gui.PostMessage(hwnd, win32con.WM_KEYDOWN, 0x20, 0)
+            time.sleep(0.05)
+            win32gui.PostMessage(hwnd, win32con.WM_KEYUP, 0x20, 0)
+            logger.info("Sent Space key to NetEase window to trigger playback")
+
+        except Exception as e:
+            logger.warning(f"Window activation failed, falling back to media key: {e}")
+            # Fallback: global media play key
+            self._send_media_key(VK_MEDIA_PLAY_PAUSE)
+
+    # ------------------------------------------------------------------
     # MCP tool methods
     # ------------------------------------------------------------------
 
@@ -421,7 +516,11 @@ class MusicPlayer:
             return {"status": "error", "message": f"播放失败: {e}"}
 
     async def search_and_play(self, song_name: str) -> dict:
-        """Search for a song and play it in the desktop client."""
+        """Search for a song and play it in the desktop client.
+
+        Flow: pyncm search → orpheus://song/{id} → verify with pycaw →
+        if not auto-playing, activate window and send play key.
+        """
         logger.info(f"search_and_play called: song_name='{song_name}'")
 
         if not song_name or not song_name.strip():
@@ -444,6 +543,7 @@ class MusicPlayer:
             )
 
             if not search_result or search_result.get("code") != 200:
+                logger.warning(f"Search API returned: {search_result}")
                 return {"status": "error", "message": f"搜索失败: {song_name}"}
 
             songs = search_result.get("result", {}).get("songs", [])
@@ -467,23 +567,65 @@ class MusicPlayer:
             )
 
             display_name = f"{title} - {artist}" if artist else title
+            logger.info(f"Found song: {display_name} (id={song_id})")
 
-            # Open in desktop client
-            await asyncio.to_thread(self._open_uri, f"orpheus://song/{song_id}")
+            # Open song in the desktop client
+            await asyncio.to_thread(
+                self._open_uri, f"orpheus://song/{song_id}"
+            )
+            await asyncio.sleep(2)
 
-            logger.info(f"Playing: {display_name} (id={song_id})")
-            return {
-                "status": "success",
-                "message": f"正在播放: {display_name}",
-            }
+            # Check if the client auto-played the song
+            is_playing = await asyncio.to_thread(self.is_music_actually_playing)
+            if is_playing:
+                logger.info(f"Song auto-played: {display_name}")
+                return {
+                    "status": "success",
+                    "message": f"正在播放: {display_name}",
+                }
+
+            # Not auto-playing → activate window and send play command
+            logger.info("Song not auto-playing, sending play command to window")
+            hwnd = await asyncio.to_thread(self._find_netease_hwnd)
+            if hwnd:
+                await asyncio.to_thread(self._activate_and_play, hwnd)
+                await asyncio.sleep(1)
+            else:
+                # Fallback: global media play key
+                logger.info("Window not found, trying global media key")
+                await asyncio.to_thread(
+                    self._send_media_key, VK_MEDIA_PLAY_PAUSE
+                )
+                await asyncio.sleep(1)
+
+            # Final verification
+            is_playing = await asyncio.to_thread(self.is_music_actually_playing)
+            if is_playing:
+                logger.info(f"Now playing: {display_name}")
+                return {
+                    "status": "success",
+                    "message": f"正在播放: {display_name}",
+                }
+            else:
+                logger.warning("Playback not detected after all attempts")
+                return {
+                    "status": "success",
+                    "message": f"已打开: {display_name}（请在客户端点击播放）",
+                }
 
         except Exception as e:
             logger.error(f"Search and play failed: {e}", exc_info=True)
             return {"status": "error", "message": f"播放失败: {e}"}
 
     async def play_favorites(self, shuffle: bool = False) -> dict:
-        """Play the user's 'My Likes' playlist in the desktop client."""
-        logger.info(f"play_favorites called: shuffle={shuffle}, has_cookie={self._ncm_has_vip_cookie}")
+        """Play the user's 'My Likes' playlist in the desktop client.
+
+        Uses orpheus://playlist/{id}/?autoplay=1 to auto-start playback.
+        """
+        logger.info(
+            f"play_favorites called: shuffle={shuffle}, "
+            f"has_cookie={self._ncm_has_vip_cookie}"
+        )
 
         if not self._ncm_has_vip_cookie:
             return {
@@ -495,16 +637,34 @@ class MusicPlayer:
             await asyncio.to_thread(self._ensure_likes_playlist_id)
 
             if self._likes_playlist_id is None:
-                return {"status": "error", "message": "无法获取「我喜欢的音乐」歌单"}
+                return {
+                    "status": "error",
+                    "message": "无法获取「我喜欢的音乐」歌单",
+                }
 
-            await asyncio.to_thread(
-                self._open_uri,
-                f"orpheus://playlist/{self._likes_playlist_id}",
+            # Open playlist with autoplay parameter
+            uri = (
+                f"orpheus://playlist/{self._likes_playlist_id}/?autoplay=1"
             )
+            logger.info(f"Opening favorites playlist: {uri}")
+            await asyncio.to_thread(self._open_uri, uri)
 
-            # Wait for playlist to load, then start playback
-            await asyncio.sleep(1.5)
-            await asyncio.to_thread(self._send_media_key, VK_MEDIA_PLAY_PAUSE)
+            # Wait for the client to load and start playing
+            await asyncio.sleep(3)
+
+            # Verify playback
+            is_playing = await asyncio.to_thread(self.is_music_actually_playing)
+            if not is_playing:
+                # autoplay didn't work, try window-level play
+                logger.info("Playlist autoplay not detected, sending play command")
+                hwnd = await asyncio.to_thread(self._find_netease_hwnd)
+                if hwnd:
+                    await asyncio.to_thread(self._activate_and_play, hwnd)
+                else:
+                    await asyncio.to_thread(
+                        self._send_media_key, VK_MEDIA_PLAY_PAUSE
+                    )
+                await asyncio.sleep(1)
 
             mode_text = "随机播放" if shuffle else "顺序播放"
             logger.info(f"Playing favorites playlist ({mode_text})")
