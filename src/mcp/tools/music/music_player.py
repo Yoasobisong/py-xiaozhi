@@ -1,17 +1,31 @@
 import asyncio
+import re
 import shutil
 import tempfile
 import time
 from pathlib import Path
 from typing import List, Optional, Tuple
+from urllib.parse import urlparse
 
 import numpy as np
 import requests
 
 from src.audio_codecs.music_decoder import MusicDecoder
 from src.constants.constants import AudioConfig
+from src.utils.config_manager import ConfigManager
 from src.utils.logging_config import get_logger
 from src.utils.resource_finder import get_user_cache_dir
+
+# NetEase Cloud Music API
+try:
+    import pyncm
+    from pyncm.apis import cloudsearch as ncm_search
+    from pyncm.apis import login as ncm_login
+    from pyncm.apis import track as ncm_track
+
+    PYNCM_AVAILABLE = True
+except ImportError:
+    PYNCM_AVAILABLE = False
 
 # 尝试导入音乐元数据库
 try:
@@ -139,19 +153,9 @@ class MusicPlayer:
         self.temp_cache_dir = self.cache_dir / "temp"
         self._init_cache_dirs()
 
-        # API配置
-        self.config = {
-            "SEARCH_URL": "http://search.kuwo.cn/r.s",
-            "PLAY_URL": "http://api.xiaodaokg.com/kuwo.php",
-            "LYRIC_URL": "https://api.xiaodaokg.com/kw/kwlyric.php",
-            "HEADERS": {
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " "AppleWebKit/537.36"
-                ),
-                "Accept": "*/*",
-                "Connection": "keep-alive",
-            },
-        }
+        # API配置 - NetEase Cloud Music
+        self._ncm_initialized = False
+        self._audio_quality = "standard"
 
         # 清理临时缓存
         self._clean_temp_cache()
@@ -164,6 +168,9 @@ class MusicPlayer:
         # 本地歌单缓存
         self._local_playlist = None
         self._last_scan_time = 0
+
+        # Initialize NetEase Cloud Music API
+        self._init_netease_api()
 
         logger.info("音乐播放器单例初始化完成 (FFmpeg + AudioCodec 模式)")
 
@@ -183,6 +190,36 @@ class MusicPlayer:
         except Exception as e:
             logger.warning(f"获取Application实例失败: {e}")
             self.app = None
+
+    def _init_netease_api(self):
+        """
+        Initialize NetEase Cloud Music API session with MUSIC_U cookie.
+        """
+        if not PYNCM_AVAILABLE:
+            logger.error("pyncm library not installed. Run: pip install pyncm")
+            return
+
+        try:
+            config_manager = ConfigManager.get_instance()
+            music_u = config_manager.get_config("MUSIC.NETEASE_MUSIC_U") or ""
+            self._audio_quality = config_manager.get_config("MUSIC.AUDIO_QUALITY") or "standard"
+
+            if music_u:
+                # Login with MUSIC_U cookie
+                pyncm.SetCurrentSession(pyncm.Session())
+                pyncm.GetCurrentSession().cookies.set("MUSIC_U", music_u)
+                self._ncm_initialized = True
+                logger.info("NetEase Cloud Music: logged in with MUSIC_U cookie")
+            else:
+                # No cookie configured, use anonymous login
+                logger.warning("MUSIC.NETEASE_MUSIC_U not configured, using anonymous login")
+                ncm_login.LoginViaAnonymousAccount()
+                self._ncm_initialized = True
+                logger.info("NetEase Cloud Music: anonymous login (some VIP songs may be unavailable)")
+
+        except Exception as e:
+            logger.error(f"NetEase Cloud Music API initialization failed: {e}")
+            self._ncm_initialized = False
 
     def _init_cache_dirs(self):
         """
@@ -776,62 +813,49 @@ class MusicPlayer:
     # 内部方法
     async def _search_song(self, song_name: str) -> Tuple[str, str]:
         """
-        搜索歌曲获取ID和URL.
+        Search song via NetEase Cloud Music API and get play URL.
         """
+        if not PYNCM_AVAILABLE or not self._ncm_initialized:
+            logger.error("NetEase Cloud Music API not initialized")
+            return "", ""
+
         try:
-            # 构建搜索参数
-            params = {
-                "all": song_name,
-                "ft": "music",
-                "newsearch": "1",
-                "alflac": "1",
-                "itemset": "web_2013",
-                "client": "kt",
-                "cluster": "0",
-                "pn": "0",
-                "rn": "1",
-                "vermerge": "1",
-                "rformat": "json",
-                "encoding": "utf8",
-                "show_copyright_off": "1",
-                "pcmp4": "1",
-                "ver": "mbox",
-                "vipver": "MUSIC_8.7.6.0.BCS31",
-                "plat": "pc",
-                "devid": "0",
-            }
-
-            # 搜索歌曲
-            response = await asyncio.to_thread(
-                requests.get,
-                self.config["SEARCH_URL"],
-                params=params,
-                headers=self.config["HEADERS"],
-                timeout=10,
+            # Step 1: Search for the song
+            search_result = await asyncio.to_thread(
+                ncm_search.GetSearchResult,
+                keyword=song_name,
+                stype=1,
+                limit=5,
             )
-            response.raise_for_status()
 
-            # 解析响应
-            text = response.text.replace("'", '"')
-
-            # 提取歌曲ID
-            song_id = self._extract_value(text, '"DC_TARGETID":"', '"')
-            if not song_id:
+            if not search_result or search_result.get("code") != 200:
+                logger.warning(f"Search failed: {search_result}")
                 return "", ""
 
-            # 提取歌曲信息
-            title = self._extract_value(text, '"NAME":"', '"') or song_name
-            artist = self._extract_value(text, '"ARTIST":"', '"')
-            album = self._extract_value(text, '"ALBUM":"', '"')
-            duration_str = self._extract_value(text, '"DURATION":"', '"')
+            result_data = search_result.get("result", {})
+            songs = result_data.get("songs", [])
+            if not songs:
+                logger.warning(f"No songs found for: {song_name}")
+                return "", ""
 
-            if duration_str:
-                try:
-                    self.total_duration = int(duration_str)
-                except ValueError:
-                    self.total_duration = 0
+            # Pick the first result
+            song = songs[0]
+            song_id = str(song.get("id", ""))
+            title = song.get("name", song_name)
 
-            # 设置显示名称
+            # Extract artist names
+            artists = song.get("ar", []) or song.get("artists", [])
+            artist = ", ".join([a.get("name", "") for a in artists if a.get("name")])
+
+            # Extract album name
+            album_info = song.get("al", {}) or song.get("album", {})
+            album = album_info.get("name", "") if album_info else ""
+
+            # Extract duration (milliseconds -> seconds)
+            duration_ms = song.get("dt", 0) or song.get("duration", 0)
+            self.total_duration = duration_ms / 1000.0 if duration_ms else 0
+
+            # Set display name
             display_name = title
             if artist:
                 display_name = f"{title} - {artist}"
@@ -840,23 +864,51 @@ class MusicPlayer:
             self.current_song = display_name
             self.song_id = song_id
 
-            # 获取播放URL
-            play_url = f"{self.config['PLAY_URL']}?ID={song_id}"
-            url_response = await asyncio.to_thread(
-                requests.get, play_url, headers=self.config["HEADERS"], timeout=10
+            # Step 2: Get play URL
+            quality_map = {
+                "standard": 128000,
+                "higher": 192000,
+                "exhigh": 320000,
+                "lossless": 999000,
+                "hires": 1999000,
+            }
+            bitrate = quality_map.get(self._audio_quality, 128000)
+
+            audio_result = await asyncio.to_thread(
+                ncm_track.GetTrackAudio,
+                song_ids=[int(song_id)],
+                bitrate=bitrate,
             )
-            url_response.raise_for_status()
 
-            play_url_text = url_response.text.strip()
-            if play_url_text and play_url_text.startswith("http"):
-                # 获取歌词
-                await self._fetch_lyrics(song_id)
-                return song_id, play_url_text
+            if not audio_result or audio_result.get("code") != 200:
+                logger.warning(f"Failed to get audio URL: {audio_result}")
+                return song_id, ""
 
-            return song_id, ""
+            audio_data_list = audio_result.get("data", [])
+            if not audio_data_list:
+                logger.warning("No audio data returned")
+                return song_id, ""
+
+            audio_data = audio_data_list[0]
+            play_url = audio_data.get("url", "")
+
+            if not play_url:
+                logger.warning(f"Song '{title}' has no play URL (may require VIP or is region-locked)")
+                return song_id, ""
+
+            logger.info(
+                f"Found song: {display_name}, "
+                f"type: {audio_data.get('type', 'unknown')}, "
+                f"bitrate: {audio_data.get('br', 0) // 1000}kbps"
+            )
+
+            # Step 3: Fetch lyrics
+            await self._fetch_lyrics(song_id)
+
+            return song_id, play_url
 
         except Exception as e:
-            logger.error(f"搜索歌曲失败: {e}")
+            logger.error(f"Search song failed: {e}", exc_info=True)
             return "", ""
 
     async def _play_url(self, url: str) -> bool:
@@ -1014,16 +1066,25 @@ class MusicPlayer:
         先检查缓存，如果缓存中没有则下载
         """
         try:
-            # 使用歌曲ID作为缓存文件名
-            cache_filename = f"{self.song_id}.mp3"
-            cache_path = self.cache_dir / cache_filename
+            # Determine file extension from URL (NetEase may return .m4a, .flac, etc.)
+            ext = ".mp3"
+            if url:
+                parsed = urlparse(url)
+                path_lower = parsed.path.lower()
+                for check_ext in [".m4a", ".flac", ".mp3", ".ogg", ".wav"]:
+                    if check_ext in path_lower:
+                        ext = check_ext
+                        break
 
-            # 检查缓存是否存在
-            if cache_path.exists():
-                logger.info(f"使用缓存: {cache_path}")
-                return cache_path
+            # Also check cache for other extensions (in case quality changed)
+            for check_ext in [ext, ".mp3", ".m4a", ".flac"]:
+                cache_path = self.cache_dir / f"{self.song_id}{check_ext}"
+                if cache_path.exists():
+                    logger.info(f"使用缓存: {cache_path}")
+                    return cache_path
 
-            # 缓存不存在，需要下载
+            # Cache miss, download
+            cache_filename = f"{self.song_id}{ext}"
             return await self._download_file(url, cache_filename)
 
         except Exception as e:
@@ -1044,7 +1105,10 @@ class MusicPlayer:
             response = await asyncio.to_thread(
                 requests.get,
                 url,
-                headers=self.config["HEADERS"],
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                    "Accept": "*/*",
+                },
                 stream=True,
                 timeout=30,
             )
@@ -1076,73 +1140,75 @@ class MusicPlayer:
 
     async def _fetch_lyrics(self, song_id: str):
         """
-        获取歌词.
+        Fetch lyrics from NetEase Cloud Music API.
         """
         try:
-            # 重置歌词
+            # Reset lyrics
             self.lyrics = []
 
-            # 构建歌词API请求
-            lyric_url = self.config.get("LYRIC_URL")
-            lyric_api_url = f"{lyric_url}?id={song_id}"
-            logger.info(f"获取歌词URL: {lyric_api_url}")
+            if not PYNCM_AVAILABLE or not self._ncm_initialized:
+                logger.warning("NetEase API not initialized, skip lyrics fetch")
+                return
 
-            response = await asyncio.to_thread(
-                requests.get, lyric_api_url, headers=self.config["HEADERS"], timeout=10
+            lyric_result = await asyncio.to_thread(
+                ncm_track.GetTrackLyrics,
+                song_id=int(song_id),
             )
-            response.raise_for_status()
 
-            # 解析JSON
-            data = response.json()
+            if not lyric_result or lyric_result.get("code") != 200:
+                logger.warning(f"Failed to fetch lyrics: {lyric_result}")
+                return
 
-            # 解析歌词
-            if (
-                data.get("code") == 200
-                and data.get("data")
-                and data["data"].get("content")
-            ):
-                lrc_content = data["data"]["content"]
+            # NetEase returns lyrics in lrc field
+            lrc_data = lyric_result.get("lrc", {})
+            lrc_content = lrc_data.get("lyric", "")
 
-                # 解析LRC格式歌词
-                lines = lrc_content.split("\n")
-                for line in lines:
-                    line = line.strip()
-                    if not line:
-                        continue
+            if not lrc_content:
+                logger.info("No lyrics available for this song")
+                return
 
-                    # 匹配时间标签格式 [mm:ss.xx]
-                    import re
+            # Parse LRC format lyrics
+            lines = lrc_content.split("\n")
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
 
-                    time_match = re.match(r"\[(\d{2}):(\d{2})\.(\d{2})\](.+)", line)
-                    if time_match:
-                        minutes = int(time_match.group(1))
-                        seconds = int(time_match.group(2))
-                        centiseconds = int(time_match.group(3))
-                        text = time_match.group(4).strip()
+                # Match time tag format [mm:ss.xx] or [mm:ss.xxx]
+                time_match = re.match(r"\[(\d{2}):(\d{2})\.(\d{2,3})\](.*)", line)
+                if time_match:
+                    minutes = int(time_match.group(1))
+                    seconds = int(time_match.group(2))
+                    frac_str = time_match.group(3)
+                    text = time_match.group(4).strip()
 
-                        # 转换为总秒数
-                        time_sec = minutes * 60 + seconds + centiseconds / 100.0
+                    # Handle both centiseconds (2 digits) and milliseconds (3 digits)
+                    if len(frac_str) == 2:
+                        frac = int(frac_str) / 100.0
+                    else:
+                        frac = int(frac_str) / 1000.0
 
-                        # 跳过空歌词和元信息歌词
-                        if (
-                            text
-                            and not text.startswith("作词")
-                            and not text.startswith("作曲")
-                            and not text.startswith("编曲")
-                            and not text.startswith("ti:")
-                            and not text.startswith("ar:")
-                            and not text.startswith("al:")
-                            and not text.startswith("by:")
-                            and not text.startswith("offset:")
-                        ):
-                            self.lyrics.append((time_sec, text))
+                    # Convert to total seconds
+                    time_sec = minutes * 60 + seconds + frac
 
-                logger.info(f"成功获取歌词，共 {len(self.lyrics)} 行")
-            else:
-                logger.warning(f"未获取到歌词或歌词格式错误: {data.get('msg', '')}")
+                    # Skip empty lyrics and metadata lines
+                    if (
+                        text
+                        and not text.startswith("作词")
+                        and not text.startswith("作曲")
+                        and not text.startswith("编曲")
+                        and not text.startswith("ti:")
+                        and not text.startswith("ar:")
+                        and not text.startswith("al:")
+                        and not text.startswith("by:")
+                        and not text.startswith("offset:")
+                    ):
+                        self.lyrics.append((time_sec, text))
+
+            logger.info(f"Successfully fetched lyrics, {len(self.lyrics)} lines")
 
         except Exception as e:
-            logger.error(f"获取歌词失败: {e}")
+            logger.error(f"Fetch lyrics failed: {e}")
 
     async def _lyrics_update_task(self):
         """
@@ -1216,22 +1282,6 @@ class MusicPlayer:
             if self.app and hasattr(self.app, "set_chat_message"):
                 await self._safe_update_ui(display_text)
                 logger.debug(f"显示歌词: {text}")
-
-    def _extract_value(self, text: str, start_marker: str, end_marker: str) -> str:
-        """
-        从文本中提取值.
-        """
-        start_pos = text.find(start_marker)
-        if start_pos == -1:
-            return ""
-
-        start_pos += len(start_marker)
-        end_pos = text.find(end_marker, start_pos)
-
-        if end_pos == -1:
-            return ""
-
-        return text[start_pos:end_pos]
 
     def _format_time(self, seconds: float) -> str:
         """

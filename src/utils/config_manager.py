@@ -75,6 +75,10 @@ class ConfigManager:
             "input_channels": None,
             "output_channels": None,
         },
+        "MUSIC": {
+            "NETEASE_MUSIC_U": "",
+            "AUDIO_QUALITY": "standard",
+        },
     }
 
     def __new__(cls):
