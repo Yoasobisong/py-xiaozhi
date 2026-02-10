@@ -241,81 +241,103 @@ class TimerTask:
 
     async def _execute_command(self):
         """
-        执行倒计时结束后的命令.
+        Execute the scheduled command when countdown finishes.
+
+        Supports two modes:
+        1. MCP tool call: command JSON has 'name' and 'arguments' fields
+        2. Pure reminder: command is '{}' or has no 'name'/'arguments' — just notify user
         """
-        logger.info(f"倒计时 {self.timer_id} 结束，准备执行MCP工具: {self.command}")
+        logger.info(f"倒计时 {self.timer_id} 结束，准备执行: {self.command}")
 
         try:
-            # 解析MCP工具调用命令
             command_dict = json.loads(self.command)
 
-            # 验证命令格式（MCP工具调用格式）
-            if "name" not in command_dict or "arguments" not in command_dict:
-                raise ValueError("MCP命令格式错误，必须包含 'name' 和 'arguments' 字段")
-
-            tool_name = command_dict["name"]
-            arguments = command_dict["arguments"]
-
-            # 获取MCP服务器并执行工具
-            from src.mcp.mcp_server import McpServer
-
-            mcp_server = McpServer.get_instance()
-
-            # 查找工具
-            tool = None
-            for t in mcp_server.tools:
-                if t.name == tool_name:
-                    tool = t
-                    break
-
-            if not tool:
-                raise ValueError(f"MCP工具不存在: {tool_name}")
-
-            # 执行MCP工具
-            result = await tool.call(arguments)
-
-            # 解析结果
-            result_data = json.loads(result)
-            is_success = not result_data.get("isError", False)
-
-            if is_success:
-                logger.info(
-                    f"倒计时 {self.timer_id} 执行MCP工具成功，工具: {tool_name}"
-                )
-                await self._notify_execution_result(True, f"已执行 {tool_name}")
+            # Mode 1: MCP tool call (has name + arguments)
+            if "name" in command_dict and "arguments" in command_dict:
+                await self._execute_mcp_tool(command_dict)
             else:
-                error_text = result_data.get("content", [{}])[0].get("text", "未知错误")
-                logger.error(f"倒计时 {self.timer_id} 执行MCP工具失败: {error_text}")
-                await self._notify_execution_result(False, error_text)
+                # Mode 2: Pure reminder (no MCP tool to call)
+                reminder_msg = self.description or command_dict.get("message", "倒计时结束")
+                logger.info(f"倒计时 {self.timer_id} 纯提醒模式: {reminder_msg}")
+                await self._notify_execution_result(True, reminder_msg)
 
         except json.JSONDecodeError:
-            error_msg = f"倒计时 {self.timer_id}: MCP命令格式错误，无法解析JSON"
-            logger.error(error_msg)
-            await self._notify_execution_result(False, error_msg)
+            # command is plain text, treat as reminder
+            reminder_msg = self.description or self.command or "倒计时结束"
+            logger.info(f"倒计时 {self.timer_id} 文本提醒: {reminder_msg}")
+            await self._notify_execution_result(True, reminder_msg)
         except Exception as e:
-            error_msg = f"倒计时 {self.timer_id} 执行MCP工具时出错: {e}"
-            logger.error(error_msg, exc_info=True)
-            await self._notify_execution_result(False, error_msg)
+            logger.error(f"倒计时 {self.timer_id} 执行出错: {e}", exc_info=True)
+            await self._notify_execution_result(False, str(e))
+
+    async def _execute_mcp_tool(self, command_dict: dict):
+        """
+        Execute an MCP tool call from a parsed command dict.
+        """
+        tool_name = command_dict["name"]
+        arguments = command_dict["arguments"]
+
+        # Get MCP server and find tool
+        from src.mcp.mcp_server import McpServer
+
+        mcp_server = McpServer.get_instance()
+
+        tool = None
+        for t in mcp_server.tools:
+            if t.name == tool_name:
+                tool = t
+                break
+
+        if not tool:
+            raise ValueError(f"MCP工具不存在: {tool_name}")
+
+        # Execute tool
+        result = await tool.call(arguments)
+
+        # Parse result
+        result_data = json.loads(result)
+        is_success = not result_data.get("isError", False)
+
+        if is_success:
+            logger.info(f"倒计时 {self.timer_id} 执行MCP工具成功: {tool_name}")
+            await self._notify_execution_result(True, f"已执行 {tool_name}")
+        else:
+            error_text = result_data.get("content", [{}])[0].get("text", "未知错误")
+            logger.error(f"倒计时 {self.timer_id} 执行MCP工具失败: {error_text}")
+            await self._notify_execution_result(False, error_text)
 
     async def _notify_execution_result(self, success: bool, result: Any):
         """
-        通知执行结果（通过TTS播报）
+        Notify user of timer result via TTS.
+
+        Uses the same pattern as CalendarPlugin._AppAdapter (src/plugins/calendar.py)
+        to trigger actual TTS via protocol, with UI text as fallback.
         """
         try:
             from src.application import Application
 
             app = Application.get_instance()
             if success:
-                message = f"倒计时 {self.timer_id} 执行完成"
-                if self.description:
-                    message = f"{self.description}执行完成"
+                message = self.description or f"倒计时 {self.timer_id} 完成"
             else:
-                message = f"倒计时 {self.timer_id} 执行失败"
-                if self.description:
-                    message = f"{self.description}执行失败"
+                message = f"{self.description or f'倒计时 {self.timer_id}'}执行失败"
 
-            print("倒计时：", message)
-            await app._send_text_tts(message)
+            logger.info(f"倒计时通知: {message}")
+
+            # Try TTS via protocol (same pattern as CalendarPlugin._AppAdapter)
+            try:
+                if getattr(app, "protocol", None):
+                    if not app.is_audio_channel_opened():
+                        await app.connect_protocol()
+                    await app.protocol.send_wake_word_detected(message)
+                    return
+            except Exception as e:
+                logger.debug(f"TTS 通知失败，回退到 UI: {e}")
+
+            # Fallback: UI text only
+            if hasattr(app, "set_chat_message"):
+                app.set_chat_message("assistant", message)
+
         except Exception as e:
             logger.warning(f"通知倒计时执行结果失败: {e}")
 

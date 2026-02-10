@@ -353,6 +353,18 @@ class McpServer:
         bazi_manager = get_bazi_manager()
         bazi_manager.init_tools(self.add_tool, PropertyList, Property, PropertyType)
 
+        # 添加网页工具
+        from src.mcp.tools.web import get_web_tools_manager
+
+        web_manager = get_web_tools_manager()
+        web_manager.init_tools(self.add_tool, PropertyList, Property, PropertyType)
+
+        # 添加剪贴板工具
+        from src.mcp.tools.clipboard import get_clipboard_tools_manager
+
+        clipboard_manager = get_clipboard_tools_manager()
+        clipboard_manager.init_tools(self.add_tool, PropertyList, Property, PropertyType)
+
         # 恢复原有工具
         self.tools.extend(original_tools)
 

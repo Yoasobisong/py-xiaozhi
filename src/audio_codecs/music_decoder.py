@@ -196,10 +196,15 @@ class MusicDecoder:
 
         if self._process:
             try:
+                # Close pipes before terminating to avoid ResourceWarning
+                for pipe in (self._process.stdout, self._process.stderr):
+                    if pipe:
+                        pipe.close()
+
                 self._process.terminate()
                 await asyncio.wait_for(self._process.wait(), timeout=2.0)
             except asyncio.TimeoutError:
-                # 强制杀死
+                # Force kill
                 try:
                     self._process.kill()
                     await self._process.wait()
@@ -207,6 +212,8 @@ class MusicDecoder:
                     pass
             except Exception as e:
                 logger.debug(f"终止 FFmpeg 进程失败: {e}")
+            finally:
+                self._process = None
 
     def is_running(self) -> bool:
         return (

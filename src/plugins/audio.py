@@ -75,16 +75,15 @@ class AudioPlugin(Plugin):
             return
 
         try:
-            # 监听 TTS 状态变化，控制音乐播放
+            # 监听 TTS 状态变化，控制音乐音量
             if message.get("type") == "tts":
                 state = message.get("state")
                 if state == "start":
-                    # TTS 开始：先清空音频队列，再暂停音乐
-                    await self._pause_music_for_tts()
+                    # TTS 开始：清空音频队列，降低音乐音量
+                    await self._duck_music_for_tts()
                 elif state == "stop":
-                    # TTS 结束：恢复音乐播放
-                    await self._resume_music_after_tts()
-                    await self.codec.clear_audio_queue()
+                    # TTS 结束：恢复音乐音量
+                    await self._restore_music_after_tts()
         except Exception as e:
             logger.error(f"处理 TTS 事件失败: {e}", exc_info=True)
 
@@ -99,82 +98,55 @@ class AudioPlugin(Plugin):
                 await self.codec.write_audio(data)
             except Exception as e:
                 logger.debug(f"写入音频数据失败: {e}")
+        else:
+            logger.warning("on_incoming_audio: codec 为 None，音频数据被丢弃")
 
-    async def _pause_music_for_tts(self):
+    async def _duck_music_for_tts(self):
         """
-        TTS 开始时：先清空音频队列，再暂停音乐.
+        TTS 开始时：清空音频队列并降低音乐音量.
         """
+        # Step 1: Clear audio queue (critical for TTS)
         try:
             if self.codec:
                 await self.codec.clear_audio_queue()
                 logger.debug("TTS 开始，已清空音频队列")
-
-            try:
-                from src.mcp.tools.music.music_player import get_music_player_instance
-
-                music_player = get_music_player_instance()
-
-                # 如果音乐正在播放且未暂停，则暂停
-                if music_player.is_playing and not music_player.paused:
-                    logger.info("TTS 开始，暂停音乐播放")
-                    result = await music_player.pause(source="tts")
-                    if result.get("status") != "success":
-                        logger.warning(f"暂停音乐返回异常: {result}")
-            except Exception as e:
-                logger.warning(f"暂停音乐失败: {e}")
-
+            else:
+                logger.warning("TTS 开始，但 codec 为 None，无法清空队列")
         except Exception as e:
-            logger.error(f"TTS 开始处理失败: {e}", exc_info=True)
+            logger.error(f"TTS 清空队列失败: {e}", exc_info=True)
 
-    async def _resume_music_after_tts(self):
+        # Step 2: Duck music volume (non-critical, errors must not affect TTS)
+        try:
+            from src.mcp.tools.music.music_player import get_music_player_instance
+
+            music_player = get_music_player_instance()
+            is_playing = await asyncio.to_thread(
+                music_player.is_music_actually_playing
+            )
+            if is_playing:
+                logger.info("TTS 开始，降低音乐音量")
+                await asyncio.to_thread(music_player.duck_volume)
+        except Exception as e:
+            logger.debug(f"降低音乐音量失败（不影响TTS）: {e}")
+
+    async def _restore_music_after_tts(self):
         """
-        TTS 结束后：恢复音乐播放或启动延迟播放.
+        TTS 结束后：恢复音乐音量.
         """
         try:
             from src.mcp.tools.music.music_player import get_music_player_instance
 
             music_player = get_music_player_instance()
-
-            if music_player._deferred_start_path:
-                logger.info("TTS 播放完成，启动延迟播放的音乐")
-                # 直接调用内部方法，跳过TTS检查
-                file_path = music_player._deferred_start_path
-                start_pos = music_player._deferred_start_position
-                music_player._deferred_start_path = None
-                music_player._deferred_start_position = 0.0
-
-                # 重新启动播放（此时TTS已结束，不会再延迟）
-                await music_player._start_playback(file_path, start_pos)
-                return
-
-            if music_player.is_playing and music_player.paused:
-                if music_player._pause_source == "tts":
-                    logger.info("TTS 播放完成，恢复音乐播放")
-                    await music_player.resume()
-                else:
-                    logger.debug(
-                        f"音乐暂停来源: {music_player._pause_source}，不自动恢复"
-                    )
-            else:
-                logger.debug(
-                    f"音乐状态: is_playing={music_player.is_playing}, "
-                    f"paused={music_player.paused}, 无需恢复"
-                )
+            if music_player._original_volume is not None:
+                logger.info("TTS 结束，恢复音乐音量")
+                await asyncio.to_thread(music_player.restore_volume)
         except Exception as e:
-            logger.error(f"恢复音乐播放失败: {e}", exc_info=True)
+            logger.debug(f"恢复音乐音量失败（不影响TTS）: {e}")
 
     async def shutdown(self) -> None:
         """
         完全关闭并释放音频资源.
         """
-        # 停止音频消费者任务
-        if self._audio_consumer_task and not self._audio_consumer_task.done():
-            self._audio_consumer_task.cancel()
-            try:
-                await self._audio_consumer_task
-            except asyncio.CancelledError:
-                pass
-
         if self.codec:
             try:
                 await self.codec.close()

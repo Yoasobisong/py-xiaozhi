@@ -10,7 +10,17 @@ from src.utils.logging_config import get_logger
 from .app_management.killer import kill_application, list_running_applications
 from .app_management.launcher import launch_application
 from .app_management.scanner import scan_installed_applications
-from .tools import get_volume, set_volume
+from .tools import (
+    cancel_shutdown,
+    get_brightness,
+    get_volume,
+    lock_screen,
+    restart_system,
+    set_brightness,
+    set_volume,
+    shutdown_system,
+    sleep_system,
+)
 
 logger = get_logger(__name__)
 
@@ -56,6 +66,16 @@ class SystemToolsManager:
 
             # 注册应用程序关闭工具
             self._register_app_killer_tools(
+                add_tool, PropertyList, Property, PropertyType
+            )
+
+            # 注册电源管理工具
+            self._register_power_management_tools(
+                add_tool, PropertyList, Property, PropertyType
+            )
+
+            # 注册亮度控制工具
+            self._register_brightness_tools(
                 add_tool, PropertyList, Property, PropertyType
             )
 
@@ -237,6 +257,130 @@ class SystemToolsManager:
             )
         )
         logger.debug("[SystemManager] 注册应用程序关闭工具成功")
+
+    def _register_power_management_tools(
+        self, add_tool, PropertyList, Property, PropertyType
+    ):
+        """
+        Register power management tools (shutdown, restart, sleep, cancel).
+        """
+        # Shutdown
+        shutdown_props = PropertyList(
+            [Property("delay", PropertyType.INTEGER, default_value=30,
+                       min_value=0, max_value=3600)]
+        )
+        add_tool(
+            (
+                "system.shutdown",
+                "Shutdown the computer. Schedules a system shutdown with a delay.\n"
+                "Use when user says: '关机', '关闭电脑', 'shutdown', 'turn off computer'.\n"
+                "Parameters:\n"
+                "- delay: Seconds before shutdown (default 30, gives time to cancel).\n"
+                "The user can cancel with system.cancel_shutdown before the delay expires.",
+                shutdown_props,
+                shutdown_system,
+            )
+        )
+
+        # Restart
+        restart_props = PropertyList(
+            [Property("delay", PropertyType.INTEGER, default_value=30,
+                       min_value=0, max_value=3600)]
+        )
+        add_tool(
+            (
+                "system.restart",
+                "Restart the computer. Schedules a system restart with a delay.\n"
+                "Use when user says: '重启', '重启电脑', 'restart', 'reboot'.\n"
+                "Parameters:\n"
+                "- delay: Seconds before restart (default 30).\n"
+                "The user can cancel with system.cancel_shutdown before the delay expires.",
+                restart_props,
+                restart_system,
+            )
+        )
+
+        # Sleep
+        sleep_props = PropertyList([])
+        add_tool(
+            (
+                "system.sleep",
+                "Put the computer to sleep/suspend mode.\n"
+                "Use when user says: '休眠', '睡眠', '待机', 'sleep', 'suspend', "
+                "'put computer to sleep'.\n"
+                "No parameters needed. Takes effect immediately.",
+                sleep_props,
+                sleep_system,
+            )
+        )
+
+        # Cancel shutdown
+        cancel_props = PropertyList([])
+        add_tool(
+            (
+                "system.cancel_shutdown",
+                "Cancel a previously scheduled shutdown or restart.\n"
+                "Use when user says: '取消关机', '取消重启', '不要关机了', "
+                "'cancel shutdown', 'cancel restart'.\n"
+                "Only works if a shutdown/restart was scheduled with a delay.",
+                cancel_props,
+                cancel_shutdown,
+            )
+        )
+
+        # Lock screen
+        lock_props = PropertyList([])
+        add_tool(
+            (
+                "system.lock_screen",
+                "Lock the screen / workstation.\n"
+                "Use when user says: '锁屏', '锁定屏幕', '锁定电脑', "
+                "'lock screen', 'lock computer', 'lock workstation'.\n"
+                "No parameters needed. Takes effect immediately.",
+                lock_props,
+                lock_screen,
+            )
+        )
+        logger.debug("[SystemManager] 注册电源管理工具成功")
+
+    def _register_brightness_tools(
+        self, add_tool, PropertyList, Property, PropertyType
+    ):
+        """
+        Register screen brightness control tools.
+        """
+        # Set brightness
+        brightness_props = PropertyList(
+            [Property("brightness", PropertyType.INTEGER,
+                       min_value=0, max_value=100)]
+        )
+        add_tool(
+            (
+                "system.set_brightness",
+                "Set the screen brightness level (0-100).\n"
+                "Use when user says: '调亮度', '亮度调到50', '屏幕太亮了', "
+                "'屏幕太暗了', 'set brightness', 'make screen brighter/dimmer'.\n"
+                "Parameter:\n"
+                "- brightness: Integer (0-100), 0 = darkest, 100 = brightest.",
+                brightness_props,
+                set_brightness,
+            )
+        )
+
+        # Get brightness
+        get_brightness_props = PropertyList([])
+        add_tool(
+            (
+                "system.get_brightness",
+                "Get the current screen brightness level.\n"
+                "Use when user says: '当前亮度多少', '亮度是多少', "
+                "'what is the brightness', 'check brightness'.\n"
+                "Returns the current brightness percentage.",
+                get_brightness_props,
+                get_brightness,
+            )
+        )
+        logger.debug("[SystemManager] 注册亮度控制工具成功")
 
     def is_initialized(self) -> bool:
         """

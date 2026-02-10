@@ -4,6 +4,8 @@
 """
 
 import asyncio
+import subprocess
+import sys
 from typing import Any, Dict
 
 from src.utils.logging_config import get_logger
@@ -124,3 +126,234 @@ def _get_application_status() -> Dict[str, Any]:
     except Exception as e:
         logger.warning(f"[SystemTools] 获取应用状态失败: {e}")
         return {"device_state": "unknown", "iot_devices": 0, "error": str(e)}
+
+
+async def shutdown_system(args: Dict[str, Any]) -> str:
+    """
+    Shutdown the system with a delay.
+    """
+    delay = args.get("delay", 30)
+    try:
+        logger.info(f"[SystemTools] Shutting down system in {delay} seconds")
+
+        if sys.platform == "win32":
+            cmd = ["shutdown", "/s", "/t", str(delay)]
+        elif sys.platform == "darwin":
+            cmd = ["sudo", "shutdown", "-h", f"+{max(1, delay // 60)}"]
+        else:
+            cmd = ["shutdown", "-h", f"+{max(1, delay // 60)}"]
+
+        await asyncio.to_thread(
+            subprocess.run, cmd, capture_output=True, text=True, timeout=10
+        )
+        logger.info(f"[SystemTools] Shutdown scheduled in {delay} seconds")
+        return f"System will shutdown in {delay} seconds. Use 'cancel_shutdown' to abort."
+
+    except Exception as e:
+        logger.error(f"[SystemTools] Shutdown failed: {e}", exc_info=True)
+        return f"Shutdown failed: {e}"
+
+
+async def restart_system(args: Dict[str, Any]) -> str:
+    """
+    Restart the system with a delay.
+    """
+    delay = args.get("delay", 30)
+    try:
+        logger.info(f"[SystemTools] Restarting system in {delay} seconds")
+
+        if sys.platform == "win32":
+            cmd = ["shutdown", "/r", "/t", str(delay)]
+        elif sys.platform == "darwin":
+            cmd = ["sudo", "shutdown", "-r", f"+{max(1, delay // 60)}"]
+        else:
+            cmd = ["shutdown", "-r", f"+{max(1, delay // 60)}"]
+
+        await asyncio.to_thread(
+            subprocess.run, cmd, capture_output=True, text=True, timeout=10
+        )
+        logger.info(f"[SystemTools] Restart scheduled in {delay} seconds")
+        return f"System will restart in {delay} seconds. Use 'cancel_shutdown' to abort."
+
+    except Exception as e:
+        logger.error(f"[SystemTools] Restart failed: {e}", exc_info=True)
+        return f"Restart failed: {e}"
+
+
+async def sleep_system(args: Dict[str, Any]) -> str:
+    """
+    Put the system to sleep/suspend.
+    """
+    try:
+        logger.info("[SystemTools] Putting system to sleep")
+
+        if sys.platform == "win32":
+            # Use rundll32 to trigger sleep (not hibernate)
+            cmd = [
+                "rundll32.exe", "powrprof.dll,SetSuspendState", "0", "1", "0"
+            ]
+        elif sys.platform == "darwin":
+            cmd = ["pmset", "sleepnow"]
+        else:
+            cmd = ["systemctl", "suspend"]
+
+        await asyncio.to_thread(
+            subprocess.run, cmd, capture_output=True, text=True, timeout=10
+        )
+        logger.info("[SystemTools] Sleep command executed")
+        return "System is going to sleep."
+
+    except Exception as e:
+        logger.error(f"[SystemTools] Sleep failed: {e}", exc_info=True)
+        return f"Sleep failed: {e}"
+
+
+async def lock_screen(args: Dict[str, Any]) -> str:
+    """
+    Lock the screen / workstation.
+    """
+    try:
+        logger.info("[SystemTools] Locking screen")
+
+        if sys.platform == "win32":
+            cmd = ["rundll32.exe", "user32.dll,LockWorkStation"]
+        elif sys.platform == "darwin":
+            cmd = [
+                "/System/Library/CoreServices/Menu Extras/User.menu/"
+                "Contents/Resources/CGSession", "-suspend"
+            ]
+        else:
+            cmd = ["loginctl", "lock-session"]
+
+        await asyncio.to_thread(
+            subprocess.run, cmd, capture_output=True, text=True, timeout=10
+        )
+        logger.info("[SystemTools] Screen locked")
+        return "Screen locked."
+
+    except Exception as e:
+        logger.error(f"[SystemTools] Lock screen failed: {e}", exc_info=True)
+        return f"Lock screen failed: {e}"
+
+
+async def cancel_shutdown(args: Dict[str, Any]) -> str:
+    """
+    Cancel a scheduled shutdown or restart.
+    """
+    try:
+        logger.info("[SystemTools] Cancelling scheduled shutdown/restart")
+
+        if sys.platform == "win32":
+            cmd = ["shutdown", "/a"]
+        else:
+            cmd = ["shutdown", "-c"]
+
+        result = await asyncio.to_thread(
+            subprocess.run, cmd, capture_output=True, text=True, timeout=10
+        )
+
+        if result.returncode == 0:
+            logger.info("[SystemTools] Shutdown cancelled successfully")
+            return "Scheduled shutdown/restart has been cancelled."
+        else:
+            return f"No scheduled shutdown to cancel, or cancel failed: {result.stderr}"
+
+    except Exception as e:
+        logger.error(f"[SystemTools] Cancel shutdown failed: {e}", exc_info=True)
+        return f"Cancel shutdown failed: {e}"
+
+
+async def set_brightness(args: Dict[str, Any]) -> str:
+    """
+    Set screen brightness level.
+    """
+    brightness = args["brightness"]
+    try:
+        logger.info(f"[SystemTools] Setting brightness to {brightness}")
+
+        if sys.platform == "win32":
+            try:
+                import screen_brightness_control as sbc
+
+                await asyncio.to_thread(sbc.set_brightness, brightness)
+                logger.info(f"[SystemTools] Brightness set to {brightness}")
+                return f"Brightness set to {brightness}%"
+            except ImportError:
+                # Fallback: use WMI via PowerShell
+                cmd = [
+                    "powershell", "-Command",
+                    f"(Get-WmiObject -Namespace root/WMI "
+                    f"-Class WmiMonitorBrightnessMethods)"
+                    f".WmiSetBrightness(1,{brightness})"
+                ]
+                result = await asyncio.to_thread(
+                    subprocess.run, cmd, capture_output=True, text=True, timeout=10
+                )
+                if result.returncode == 0:
+                    return f"Brightness set to {brightness}%"
+                return f"Failed to set brightness: {result.stderr}"
+        elif sys.platform == "darwin":
+            # macOS: use brightness command if available
+            cmd = ["brightness", str(brightness / 100.0)]
+            await asyncio.to_thread(
+                subprocess.run, cmd, capture_output=True, text=True, timeout=10
+            )
+            return f"Brightness set to {brightness}%"
+        else:
+            # Linux: use xrandr or brightnessctl
+            cmd = ["brightnessctl", "set", f"{brightness}%"]
+            await asyncio.to_thread(
+                subprocess.run, cmd, capture_output=True, text=True, timeout=10
+            )
+            return f"Brightness set to {brightness}%"
+
+    except Exception as e:
+        logger.error(f"[SystemTools] Set brightness failed: {e}", exc_info=True)
+        return f"Set brightness failed: {e}"
+
+
+async def get_brightness(args: Dict[str, Any]) -> str:
+    """
+    Get current screen brightness level.
+    """
+    try:
+        logger.info("[SystemTools] Getting current brightness")
+
+        if sys.platform == "win32":
+            try:
+                import screen_brightness_control as sbc
+
+                brightness = await asyncio.to_thread(sbc.get_brightness)
+                # sbc.get_brightness returns a list of brightness values
+                current = brightness[0] if isinstance(brightness, list) else brightness
+                logger.info(f"[SystemTools] Current brightness: {current}")
+                return f"Current brightness: {current}%"
+            except ImportError:
+                cmd = [
+                    "powershell", "-Command",
+                    "(Get-WmiObject -Namespace root/WMI "
+                    "-Class WmiMonitorBrightness).CurrentBrightness"
+                ]
+                result = await asyncio.to_thread(
+                    subprocess.run, cmd, capture_output=True, text=True, timeout=10
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    return f"Current brightness: {result.stdout.strip()}%"
+                return "Failed to get brightness"
+        elif sys.platform == "darwin":
+            cmd = ["brightness", "-l"]
+            result = await asyncio.to_thread(
+                subprocess.run, cmd, capture_output=True, text=True, timeout=10
+            )
+            return f"Brightness info: {result.stdout}"
+        else:
+            cmd = ["brightnessctl", "get"]
+            result = await asyncio.to_thread(
+                subprocess.run, cmd, capture_output=True, text=True, timeout=10
+            )
+            return f"Current brightness: {result.stdout.strip()}"
+
+    except Exception as e:
+        logger.error(f"[SystemTools] Get brightness failed: {e}", exc_info=True)
+        return f"Get brightness failed: {e}"
+

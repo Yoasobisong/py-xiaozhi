@@ -1,1330 +1,600 @@
+"""NetEase Cloud Music controller.
+
+Controls the NetEase Cloud Music desktop client via:
+- orpheus:// URI scheme (open specific songs/playlists)
+- Windows media keys (play/pause/stop/next/prev)
+- pyncm API (search songs, get playlists)
+- pycaw audio session API (detect real playback state)
+"""
+
 import asyncio
-import re
-import shutil
-import tempfile
-import time
-from pathlib import Path
-from typing import List, Optional, Tuple
-from urllib.parse import urlparse
+import ctypes
+import ctypes.wintypes
+import os
+import platform
+import subprocess
+from typing import Optional
 
-import numpy as np
-import requests
-
-from src.audio_codecs.music_decoder import MusicDecoder
-from src.constants.constants import AudioConfig
 from src.utils.config_manager import ConfigManager
 from src.utils.logging_config import get_logger
-from src.utils.resource_finder import get_user_cache_dir
 
-# NetEase Cloud Music API
+logger = get_logger(__name__)
+
+# NetEase Cloud Music API (optional dependency)
 try:
     import pyncm
     from pyncm.apis import cloudsearch as ncm_search
     from pyncm.apis import login as ncm_login
-    from pyncm.apis import track as ncm_track
+    from pyncm.apis import user as ncm_user
 
     PYNCM_AVAILABLE = True
 except ImportError:
     PYNCM_AVAILABLE = False
 
-# 尝试导入音乐元数据库
-try:
-    from mutagen import File as MutagenFile
-    from mutagen.id3 import ID3NoHeaderError
+# Windows media key virtual-key codes
+VK_MEDIA_PLAY_PAUSE = 0xB3
+VK_MEDIA_NEXT_TRACK = 0xB0
+VK_MEDIA_PREV_TRACK = 0xB1
+VK_MEDIA_STOP = 0xB2
 
-    MUTAGEN_AVAILABLE = True
-except ImportError:
-    MUTAGEN_AVAILABLE = False
+KEYEVENTF_EXTENDEDKEY = 0x0001
+KEYEVENTF_KEYUP = 0x0002
 
-logger = get_logger(__name__)
+# NetEase Cloud Music process name
+NETEASE_PROCESS_NAME = "cloudmusic.exe"
 
-
-class MusicMetadata:
-    """
-    音乐元数据类.
-    """
-
-    def __init__(self, file_path: Path):
-        self.file_path = file_path
-        self.filename = file_path.name
-        self.file_id = file_path.stem  # 文件名去掉扩展名，即歌曲ID
-        self.file_size = file_path.stat().st_size
-
-        # 从文件提取的元数据
-        self.title = None
-        self.artist = None
-        self.album = None
-        self.duration = None  # 秒数
-
-    def extract_metadata(self) -> bool:
-        """
-        提取音乐文件元数据.
-        """
-        if not MUTAGEN_AVAILABLE:
-            return False
-
-        try:
-            audio_file = MutagenFile(self.file_path)
-            if audio_file is None:
-                return False
-
-            # 基本信息
-            if hasattr(audio_file, "info"):
-                self.duration = getattr(audio_file.info, "length", None)
-
-            # ID3标签信息
-            tags = audio_file.tags if audio_file.tags else {}
-
-            # 标题
-            self.title = self._get_tag_value(tags, ["TIT2", "TITLE", "\xa9nam"])
-
-            # 艺术家
-            self.artist = self._get_tag_value(tags, ["TPE1", "ARTIST", "\xa9ART"])
-
-            # 专辑
-            self.album = self._get_tag_value(tags, ["TALB", "ALBUM", "\xa9alb"])
-
-            return True
-
-        except ID3NoHeaderError:
-            # 没有ID3标签，不是错误
-            return True
-        except Exception as e:
-            logger.debug(f"提取元数据失败 {self.filename}: {e}")
-            return False
-
-    def _get_tag_value(self, tags: dict, tag_names: List[str]) -> Optional[str]:
-        """
-        从多个可能的标签名中获取值.
-        """
-        for tag_name in tag_names:
-            if tag_name in tags:
-                value = tags[tag_name]
-                if isinstance(value, list) and value:
-                    return str(value[0])
-                elif value:
-                    return str(value)
-        return None
-
-    def format_duration(self) -> str:
-        """
-        格式化播放时长.
-        """
-        if self.duration is None:
-            return "未知"
-
-        minutes = int(self.duration) // 60
-        seconds = int(self.duration) % 60
-        return f"{minutes:02d}:{seconds:02d}"
+# Volume level during TTS playback (0.0 ~ 1.0)
+TTS_DUCK_LEVEL = 0.2
 
 
 class MusicPlayer:
+    """Singleton music controller for NetEase Cloud Music desktop client.
+
+    Actual playback state is detected from Windows audio sessions (pycaw)
+    to avoid stale state bugs. Volume ducking is used during TTS speech
+    instead of pause/resume to keep music playing at lower volume.
+    """
+
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance._initialized = False
+        return cls._instance
+
     def __init__(self):
-        # FFmpeg 解码器和播放队列
-        self.decoder: Optional[MusicDecoder] = None
-        self._music_queue: Optional[asyncio.Queue] = None
-        self._playback_task: Optional[asyncio.Task] = None
+        if self._initialized:
+            return
+        self._initialized = True
 
-        # 核心播放状态
-        self.current_song = ""
-        self.current_url = ""
-        self.song_id = ""
-        self.total_duration = 0
-        self.is_playing = False
-        self.paused = False
-        self.current_position = 0
-        self.start_play_time = 0
-        self._pause_source: Optional[str] = None  # "tts" | "manual" | None
+        # TTS volume ducking
+        self._original_volume: Optional[float] = None
 
-        # 当前播放文件路径（用于暂停/恢复）
-        self._current_file_path: Optional[Path] = None
-
-        # 延迟启动：等待TTS结束后启动
-        self._deferred_start_path: Optional[Path] = None
-        self._deferred_start_position: float = 0.0
-
-        # 歌词相关
-        self.lyrics = []  # 歌词列表，格式为 [(时间, 文本), ...]
-        self.current_lyric_index = -1  # 当前歌词索引
-
-        # 缓存目录设置 - 使用用户缓存目录确保可写
-        user_cache_dir = get_user_cache_dir()
-        self.cache_dir = user_cache_dir / "music"
-        self.temp_cache_dir = self.cache_dir / "temp"
-        self._init_cache_dirs()
-
-        # API配置 - NetEase Cloud Music
+        # NetEase Cloud Music API state
         self._ncm_initialized = False
-        self._audio_quality = "standard"
+        self._ncm_has_vip_cookie = False
+        self._user_id: Optional[int] = None
+        self._likes_playlist_id: Optional[int] = None
 
-        # 清理临时缓存
-        self._clean_temp_cache()
-
-        # 获取应用程序实例和 AudioCodec
-        self.app = None
-        self.audio_codec = None
-        self._initialize_app_reference()
-
-        # 本地歌单缓存
-        self._local_playlist = None
-        self._last_scan_time = 0
-
-        # Initialize NetEase Cloud Music API
+        # Initialize NetEase API
         self._init_netease_api()
+        logger.info("MusicPlayer initialized")
 
-        logger.info("音乐播放器单例初始化完成 (FFmpeg + AudioCodec 模式)")
-
-    def _initialize_app_reference(self):
-        """
-        初始化应用程序引用和 AudioCodec.
-        """
-        try:
-            from src.application import Application
-
-            self.app = Application.get_instance()
-            self.audio_codec = getattr(self.app, "audio_codec", None)
-
-            if not self.audio_codec:
-                logger.warning("AudioCodec 未初始化，音乐播放可能不可用")
-
-        except Exception as e:
-            logger.warning(f"获取Application实例失败: {e}")
-            self.app = None
+    # ------------------------------------------------------------------
+    # NetEase API initialization
+    # ------------------------------------------------------------------
 
     def _init_netease_api(self):
-        """
-        Initialize NetEase Cloud Music API session with MUSIC_U cookie.
-        """
+        """Initialize NetEase Cloud Music API session with MUSIC_U cookie."""
         if not PYNCM_AVAILABLE:
-            logger.error("pyncm library not installed. Run: pip install pyncm")
+            logger.warning("pyncm not installed. Search/favorites unavailable.")
             return
 
         try:
             config_manager = ConfigManager.get_instance()
             music_u = config_manager.get_config("MUSIC.NETEASE_MUSIC_U") or ""
-            self._audio_quality = config_manager.get_config("MUSIC.AUDIO_QUALITY") or "standard"
 
             if music_u:
-                # Login with MUSIC_U cookie
                 pyncm.SetCurrentSession(pyncm.Session())
                 pyncm.GetCurrentSession().cookies.set("MUSIC_U", music_u)
                 self._ncm_initialized = True
+                self._ncm_has_vip_cookie = True
                 logger.info("NetEase Cloud Music: logged in with MUSIC_U cookie")
             else:
-                # No cookie configured, use anonymous login
-                logger.warning("MUSIC.NETEASE_MUSIC_U not configured, using anonymous login")
+                logger.warning(
+                    "MUSIC.NETEASE_MUSIC_U not configured, using anonymous login. "
+                    "VIP songs will only play ~30s preview."
+                )
                 ncm_login.LoginViaAnonymousAccount()
                 self._ncm_initialized = True
-                logger.info("NetEase Cloud Music: anonymous login (some VIP songs may be unavailable)")
+                logger.info("NetEase Cloud Music: anonymous login")
 
         except Exception as e:
-            logger.error(f"NetEase Cloud Music API initialization failed: {e}")
+            logger.error(f"NetEase Cloud Music API init failed: {e}")
             self._ncm_initialized = False
 
-    def _init_cache_dirs(self):
-        """
-        初始化缓存目录.
-        """
+    def _ensure_user_id(self):
+        """Fetch and cache the current user ID."""
+        if self._user_id is not None:
+            return
+        if not self._ncm_has_vip_cookie:
+            return
         try:
-            # 创建主缓存目录
-            self.cache_dir.mkdir(parents=True, exist_ok=True)
-            # 创建临时缓存目录
-            self.temp_cache_dir.mkdir(parents=True, exist_ok=True)
-            logger.info(f"音乐缓存目录初始化完成: {self.cache_dir}")
+            status = ncm_login.GetCurrentLoginStatus()
+            profile = status.get("profile", {})
+            if profile:
+                self._user_id = profile.get("userId")
+                logger.info(f"NetEase user ID: {self._user_id}")
         except Exception as e:
-            logger.error(f"创建缓存目录失败: {e}")
-            # 回退到系统临时目录
-            self.cache_dir = Path(tempfile.gettempdir()) / "xiaozhi_music_cache"
-            self.temp_cache_dir = self.cache_dir / "temp"
-            self.cache_dir.mkdir(parents=True, exist_ok=True)
-            self.temp_cache_dir.mkdir(parents=True, exist_ok=True)
+            logger.warning(f"Failed to get user ID: {e}")
 
-    def _clean_temp_cache(self):
+    def _ensure_likes_playlist_id(self):
+        """Fetch and cache the user's 'My Likes' playlist ID."""
+        if self._likes_playlist_id is not None:
+            return
+        self._ensure_user_id()
+        if self._user_id is None:
+            return
+        try:
+            result = ncm_user.GetUserPlaylists(user_id=self._user_id, limit=1)
+            playlists = result.get("playlist", [])
+            if playlists:
+                self._likes_playlist_id = playlists[0].get("id")
+                logger.info(f"Likes playlist ID: {self._likes_playlist_id}")
+        except Exception as e:
+            logger.warning(f"Failed to get likes playlist: {e}")
+
+    # ------------------------------------------------------------------
+    # Windows media key helper
+    # ------------------------------------------------------------------
+
+    def _send_media_key(self, vk_code: int):
+        """Send a Windows media key event via user32.keybd_event."""
+        if platform.system() != "Windows":
+            logger.warning("Media key control only supported on Windows")
+            return
+        try:
+            user32 = ctypes.windll.user32
+            user32.keybd_event(vk_code, 0, KEYEVENTF_EXTENDEDKEY, 0)
+            user32.keybd_event(
+                vk_code, 0, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, 0
+            )
+        except Exception as e:
+            logger.error(f"Failed to send media key: {e}")
+
+    def _open_uri(self, uri: str):
+        """Open an orpheus:// URI to control the desktop client."""
+        try:
+            os.startfile(uri)
+            logger.info(f"Opened URI: {uri}")
+        except OSError:
+            # orpheus:// not registered, fall back to web player
+            if uri.startswith("orpheus://song/"):
+                song_id = uri.split("/")[-1]
+                web_url = f"https://music.163.com/#/song?id={song_id}"
+            elif uri.startswith("orpheus://playlist/"):
+                playlist_id = uri.split("/")[-1]
+                web_url = f"https://music.163.com/#/playlist?id={playlist_id}"
+            else:
+                logger.error(f"Failed to open URI: {uri}")
+                raise
+
+            logger.info(f"Desktop client not found, opening web: {web_url}")
+            import webbrowser
+
+            webbrowser.open(web_url)
+
+    # ------------------------------------------------------------------
+    # Playback state detection
+    # ------------------------------------------------------------------
+
+    def is_music_app_running(self) -> bool:
+        """Check if NetEase Cloud Music process is running."""
+        if platform.system() != "Windows":
+            return False
+        try:
+            result = subprocess.run(
+                ["tasklist", "/FI", f"IMAGENAME eq {NETEASE_PROCESS_NAME}", "/NH"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            return NETEASE_PROCESS_NAME.lower() in result.stdout.lower()
+        except Exception as e:
+            logger.debug(f"Process check failed: {e}")
+            return False
+
+    def is_music_actually_playing(self) -> bool:
+        """Check if NetEase Cloud Music is actively outputting audio.
+
+        Uses Windows audio session API (pycaw) to detect real playback state.
+        AudioSessionState: 0=Inactive, 1=Active (playing), 2=Expired.
         """
-        清理临时缓存文件.
+        if platform.system() != "Windows":
+            return False
+        try:
+            from pycaw.pycaw import AudioUtilities
+
+            sessions = AudioUtilities.GetAllSessions()
+            for session in sessions:
+                if (
+                    session.Process
+                    and session.Process.name().lower() == NETEASE_PROCESS_NAME
+                ):
+                    # AudioSessionStateActive = 1
+                    if session.State == 1:
+                        return True
+            return False
+        except ImportError:
+            logger.warning("pycaw not installed, falling back to process check")
+            return self.is_music_app_running()
+        except Exception as e:
+            logger.debug(f"Audio session check failed: {e}")
+            return self.is_music_app_running()
+
+    # ------------------------------------------------------------------
+    # Volume ducking for TTS
+    # ------------------------------------------------------------------
+
+    def _get_music_session(self):
+        """Get the pycaw audio session for cloudmusic.exe."""
+        if platform.system() != "Windows":
+            return None
+        try:
+            from pycaw.pycaw import AudioUtilities
+
+            sessions = AudioUtilities.GetAllSessions()
+            for session in sessions:
+                if (
+                    session.Process
+                    and session.Process.name().lower() == NETEASE_PROCESS_NAME
+                ):
+                    return session
+        except ImportError:
+            logger.debug("pycaw not installed, cannot get music session")
+        except Exception as e:
+            logger.debug(f"Failed to get music session: {e}")
+        return None
+
+    def duck_volume(self):
+        """Lower music volume for TTS speech."""
+        session = self._get_music_session()
+        if not session:
+            return False
+        try:
+            vol = session.SimpleAudioVolume
+            current = vol.GetMasterVolume()
+            # Skip if already ducked or volume is already low
+            if current <= TTS_DUCK_LEVEL:
+                logger.debug(f"Volume already low ({current:.2f}), skip duck")
+                return False
+            self._original_volume = current
+            vol.SetMasterVolume(TTS_DUCK_LEVEL, None)
+            logger.info(
+                f"Music volume ducked: {self._original_volume:.2f} -> {TTS_DUCK_LEVEL}"
+            )
+            return True
+        except Exception as e:
+            logger.debug(f"Duck volume failed: {e}")
+            return False
+
+    def restore_volume(self):
+        """Restore music volume after TTS speech."""
+        if self._original_volume is None:
+            return False
+        session = self._get_music_session()
+        if not session:
+            self._original_volume = None
+            return False
+        try:
+            vol = session.SimpleAudioVolume
+            vol.SetMasterVolume(self._original_volume, None)
+            logger.info(f"Music volume restored: {self._original_volume:.2f}")
+            self._original_volume = None
+            return True
+        except Exception as e:
+            logger.debug(f"Restore volume failed: {e}")
+            self._original_volume = None
+            return False
+
+    # ------------------------------------------------------------------
+    # Window title detection
+    # ------------------------------------------------------------------
+
+    def _get_netease_window_title(self) -> Optional[str]:
+        """Get the window title of NetEase Cloud Music main window.
+
+        Enumerates all windows, matches by process ID to find the
+        NetEase Cloud Music window, and returns its title.
+        The title typically shows 'song_name - artist_name' when playing.
+        """
+        if platform.system() != "Windows":
+            return None
+        try:
+            user32 = ctypes.windll.user32
+
+            # Get NetEase Cloud Music PIDs
+            result = subprocess.run(
+                [
+                    "tasklist", "/FI",
+                    f"IMAGENAME eq {NETEASE_PROCESS_NAME}",
+                    "/FO", "CSV", "/NH",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+
+            netease_pids = set()
+            for line in result.stdout.strip().split("\n"):
+                parts = line.strip('"').split('","')
+                if len(parts) >= 2:
+                    try:
+                        netease_pids.add(int(parts[1]))
+                    except ValueError:
+                        pass
+
+            if not netease_pids:
+                return None
+
+            # Enumerate windows and find matching title
+            best_title = None
+            WNDENUMPROC = ctypes.WINFUNCTYPE(
+                ctypes.wintypes.BOOL,
+                ctypes.wintypes.HWND,
+                ctypes.wintypes.LPARAM,
+            )
+
+            def _enum_callback(hwnd, _lparam):
+                nonlocal best_title
+                # Check if window is visible
+                if not user32.IsWindowVisible(hwnd):
+                    return True
+
+                # Get process ID
+                pid = ctypes.wintypes.DWORD()
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+
+                if pid.value not in netease_pids:
+                    return True
+
+                # Get window title
+                length = user32.GetWindowTextLengthW(hwnd) + 1
+                if length <= 1:
+                    return True
+                buf = ctypes.create_unicode_buffer(length)
+                user32.GetWindowTextW(hwnd, buf, length)
+                title = buf.value.strip()
+
+                # Skip generic/empty titles
+                if title and title != "网易云音乐":
+                    best_title = title
+
+                return True
+
+            user32.EnumWindows(WNDENUMPROC(_enum_callback), 0)
+            return best_title
+
+        except Exception as e:
+            logger.debug(f"Failed to get window title: {e}")
+            return None
+
+    # ------------------------------------------------------------------
+    # MCP tool methods
+    # ------------------------------------------------------------------
+
+    async def play(self) -> dict:
+        """Open NetEase Cloud Music and start playing.
+
+        If the app is not running, launches it first.
+        Only sends play/pause media key if music is NOT already playing,
+        to avoid toggling an already-playing track to paused.
         """
         try:
-            # 清空临时缓存目录中的所有文件
-            for file_path in self.temp_cache_dir.glob("*"):
+            if not await asyncio.to_thread(self.is_music_app_running):
                 try:
-                    if file_path.is_file():
-                        file_path.unlink()
-                        logger.debug(f"已删除临时缓存文件: {file_path.name}")
+                    await asyncio.to_thread(self._open_uri, "orpheus://")
+                    logger.info("Launching NetEase Cloud Music")
+                    await asyncio.sleep(3)
                 except Exception as e:
-                    logger.warning(f"删除临时缓存文件失败: {file_path.name}, {e}")
+                    logger.error(f"Failed to launch NetEase Cloud Music: {e}")
+                    return {
+                        "status": "error",
+                        "message": f"无法打开网易云音乐: {e}",
+                    }
 
-            logger.info("临时音乐缓存清理完成")
-        except Exception as e:
-            logger.error(f"清理临时缓存目录失败: {e}")
-
-    def _scan_local_music(self, force_refresh: bool = False) -> List[MusicMetadata]:
-        """
-        扫描本地音乐缓存，返回歌单.
-        """
-        current_time = time.time()
-
-        # 如果不强制刷新且缓存未过期（5分钟），直接返回缓存
-        if (
-            not force_refresh
-            and self._local_playlist is not None
-            and (current_time - self._last_scan_time) < 300
-        ):
-            return self._local_playlist
-
-        playlist = []
-
-        if not self.cache_dir.exists():
-            logger.warning(f"缓存目录不存在: {self.cache_dir}")
-            return playlist
-
-        # 查找所有音乐文件
-        music_files = []
-        for pattern in ["*.mp3", "*.m4a", "*.flac", "*.wav", "*.ogg"]:
-            music_files.extend(self.cache_dir.glob(pattern))
-
-        logger.debug(f"找到 {len(music_files)} 个音乐文件")
-
-        # 扫描每个文件
-        for file_path in music_files:
-            try:
-                metadata = MusicMetadata(file_path)
-
-                # 尝试提取元数据
-                if MUTAGEN_AVAILABLE:
-                    metadata.extract_metadata()
-
-                playlist.append(metadata)
-
-            except Exception as e:
-                logger.debug(f"处理音乐文件失败 {file_path.name}: {e}")
-
-        # 按艺术家和标题排序
-        playlist.sort(key=lambda x: (x.artist or "Unknown", x.title or x.filename))
-
-        # 更新缓存
-        self._local_playlist = playlist
-        self._last_scan_time = current_time
-
-        logger.info(f"扫描完成，找到 {len(playlist)} 首本地音乐")
-        return playlist
-
-    async def get_local_playlist(self, force_refresh: bool = False) -> dict:
-        """
-        获取本地音乐歌单.
-        """
-        try:
-            playlist = self._scan_local_music(force_refresh)
-
-            if not playlist:
-                return {
-                    "status": "info",
-                    "message": "本地缓存中没有音乐文件",
-                    "playlist": [],
-                    "total_count": 0,
-                }
-
-            # 格式化歌单，简洁格式方便 AI 读取
-            formatted_playlist = []
-            for metadata in playlist:
-                title = metadata.title or "未知标题"
-                artist = metadata.artist or "未知艺术家"
-                song_info = f"{title} - {artist}"
-                formatted_playlist.append(song_info)
-
-            return {
-                "status": "success",
-                "message": f"找到 {len(playlist)} 首本地音乐",
-                "playlist": formatted_playlist,
-                "total_count": len(playlist),
-            }
-
-        except Exception as e:
-            logger.error(f"获取本地歌单失败: {e}")
-            return {
-                "status": "error",
-                "message": f"获取本地歌单失败: {str(e)}",
-                "playlist": [],
-                "total_count": 0,
-            }
-
-    async def search_local_music(self, query: str) -> dict:
-        """
-        搜索本地音乐.
-        """
-        try:
-            playlist = self._scan_local_music()
-
-            if not playlist:
-                return {
-                    "status": "info",
-                    "message": "本地缓存中没有音乐文件",
-                    "results": [],
-                    "found_count": 0,
-                }
-
-            query = query.lower()
-            results = []
-
-            for metadata in playlist:
-                # 在标题、艺术家、文件名中搜索
-                searchable_text = " ".join(
-                    filter(
-                        None,
-                        [
-                            metadata.title,
-                            metadata.artist,
-                            metadata.album,
-                            metadata.filename,
-                        ],
-                    )
-                ).lower()
-
-                if query in searchable_text:
-                    title = metadata.title or "未知标题"
-                    artist = metadata.artist or "未知艺术家"
-                    song_info = f"{title} - {artist}"
-                    results.append(
-                        {
-                            "song_info": song_info,
-                            "file_id": metadata.file_id,
-                            "duration": metadata.format_duration(),
-                        }
-                    )
-
-            return {
-                "status": "success",
-                "message": f"在本地音乐中找到 {len(results)} 首匹配的歌曲",
-                "results": results,
-                "found_count": len(results),
-            }
-
-        except Exception as e:
-            logger.error(f"搜索本地音乐失败: {e}")
-            return {
-                "status": "error",
-                "message": f"搜索失败: {str(e)}",
-                "results": [],
-                "found_count": 0,
-            }
-
-    async def play_local_song_by_id(self, file_id: str) -> dict:
-        """
-        根据文件ID播放本地歌曲.
-        """
-        try:
-            # 构建文件路径
-            file_path = self.cache_dir / f"{file_id}.mp3"
-
-            if not file_path.exists():
-                # 尝试其他格式
-                for ext in [".m4a", ".flac", ".wav", ".ogg"]:
-                    alt_path = self.cache_dir / f"{file_id}{ext}"
-                    if alt_path.exists():
-                        file_path = alt_path
-                        break
-                else:
-                    return {"status": "error", "message": f"本地文件不存在: {file_id}"}
-
-            # 获取歌曲信息
-            metadata = MusicMetadata(file_path)
-            if MUTAGEN_AVAILABLE:
-                metadata.extract_metadata()
-
-            # 更新歌曲信息
-            title = metadata.title or "未知标题"
-            artist = metadata.artist or "未知艺术家"
-            self.current_song = f"{title} - {artist}"
-            self.song_id = file_id
-            self.total_duration = metadata.duration or 0
-            self.current_url = str(file_path)  # 本地文件路径
-            self.lyrics = []  # 本地文件暂不支持歌词
-
-            # 直接开始播放
-            success = await self._start_playback(file_path)
-
-            if success:
-                # 返回歌曲信息（包含时长等详细信息）
-                duration_str = self._format_time(self.total_duration)
-                return {
-                    "status": "success",
-                    "message": f"正在播放: {self.current_song}",
-                    "song": self.current_song,
-                    "duration": duration_str,
-                    "total_seconds": self.total_duration,
-                }
+            # Only send toggle key if not already playing
+            is_playing = await asyncio.to_thread(self.is_music_actually_playing)
+            if not is_playing:
+                await asyncio.to_thread(self._send_media_key, VK_MEDIA_PLAY_PAUSE)
+                logger.info("Music play command sent (was not playing)")
             else:
-                return {"status": "error", "message": "播放失败"}
+                logger.info("Music already playing, no toggle needed")
+
+            return {"status": "success", "message": "已开始播放音乐"}
 
         except Exception as e:
-            logger.error(f"播放本地音乐失败: {e}")
-            return {"status": "error", "message": f"播放失败: {str(e)}"}
+            logger.error(f"Play failed: {e}", exc_info=True)
+            return {"status": "error", "message": f"播放失败: {e}"}
 
-    # 内部方法：位置和进度计算
-    async def get_position(self):
-        if not self.is_playing or self.paused:
-            return self.current_position
-
-        current_pos = min(self.total_duration, time.time() - self.start_play_time)
-
-        # 检查是否播放完成
-        if current_pos >= self.total_duration and self.total_duration > 0:
-            await self._handle_playback_finished()
-
-        return current_pos
-
-    async def get_progress(self):
-        """
-        获取播放进度百分比.
-        """
-        if self.total_duration <= 0:
-            return 0
-        position = await self.get_position()
-        return round(position * 100 / self.total_duration, 1)
-
-    async def _handle_playback_finished(self):
-        """
-        处理播放完成.
-        """
-        if self.is_playing:
-            logger.info(f"歌曲播放完成: {self.current_song}")
-            # 停止解码器
-            if self.decoder:
-                await self.decoder.stop()
-                self.decoder = None
-
-            self.is_playing = False
-            self.paused = False
-            self.current_position = self.total_duration
-
-            # 更新UI显示完成状态
-            if self.app and hasattr(self.app, "set_chat_message"):
-                dur_str = self._format_time(self.total_duration)
-                await self._safe_update_ui(f"播放完成: {self.current_song} [{dur_str}]")
-
-    # 核心方法
     async def search_and_play(self, song_name: str) -> dict:
-        """
-        搜索并播放歌曲.
-        """
-        try:
-            # 搜索歌曲
-            song_id, url = await self._search_song(song_name)
-            if not song_id or not url:
-                return {"status": "error", "message": f"未找到歌曲: {song_name}"}
+        """Search for a song and play it in the desktop client."""
+        logger.info(f"search_and_play called: song_name='{song_name}'")
 
-            # 播放歌曲
-            success = await self._play_url(url)
-            if success:
-                # 返回歌曲信息（包含时长等详细信息）
-                duration_str = self._format_time(self.total_duration)
-                return {
-                    "status": "success",
-                    "message": f"正在播放: {self.current_song}",
-                    "song": self.current_song,
-                    "duration": duration_str,
-                    "total_seconds": self.total_duration,
-                }
-            else:
-                return {"status": "error", "message": "播放失败"}
+        if not song_name or not song_name.strip():
+            return {"status": "error", "message": "歌曲名不能为空"}
 
-        except Exception as e:
-            logger.error(f"搜索播放失败: {e}")
-            return {"status": "error", "message": f"操作失败: {str(e)}"}
-
-    async def stop(self) -> dict:
-        """
-        停止播放.
-        """
-        try:
-            if not self.is_playing and not self._pending_play:
-                return {"status": "info", "message": "没有正在播放的歌曲"}
-
-            current_song = self.current_song
-
-            # 停止解码器
-            if self.decoder:
-                await self.decoder.stop()
-                self.decoder = None
-
-            # 取消播放任务
-            if self._playback_task and not self._playback_task.done():
-                self._playback_task.cancel()
-                try:
-                    await self._playback_task
-                except asyncio.CancelledError:
-                    pass
-
-            # 清空队列
-            if self._music_queue:
-                while not self._music_queue.empty():
-                    try:
-                        self._music_queue.get_nowait()
-                    except asyncio.QueueEmpty:
-                        break
-
-            # 重置状态
-            self.is_playing = False
-            self.paused = False
-            self._pause_source = None  # 清除暂停来源标记
-            self._pending_play = False
-            self._pending_file_path = None
-            self.current_position = 0
-
-            # 更新UI
-            if self.app and hasattr(self.app, "set_chat_message"):
-                await self._safe_update_ui(f"已停止: {current_song}")
-
-            logger.info(f"停止播放: {current_song}")
-            return {"status": "success", "message": "已停止"}
-
-        except Exception as e:
-            logger.error(f"停止播放失败: {e}")
-            return {"status": "error", "message": f"停止失败: {str(e)}"}
-
-    async def pause(self, source: str = "manual") -> dict:
-        """暂停播放（只停止解码器，不清空队列）.
-
-        Args:
-            source: 暂停来源，"manual"=用户主动暂停, "tts"=TTS触发的暂停
-        """
-        try:
-            if not self.is_playing:
-                return {"status": "info", "message": "没有正在播放的歌曲"}
-
-            if self.paused:
-                # 如果已经暂停，但来源不同，更新来源（用户意图优先）
-                if self._pause_source != source:
-                    old_source = self._pause_source
-                    self._pause_source = source
-                    logger.info(f"更新暂停来源: {old_source} → {source}")
-                return {"status": "info", "message": "已经处于暂停状态"}
-
-            # ✅ 立即设置暂停标志，防止重复调用
-            self.paused = True
-            self._pause_source = source
-
-            # 记录暂停时的播放位置
-            if self.start_play_time > 0:
-                self.current_position = time.time() - self.start_play_time
-
-            # 停止解码器（停止生成新数据）
-            if self.decoder:
-                await self.decoder.stop()
-                self.decoder = None
-
-            # 等待解码器完全停止
-            await asyncio.sleep(0.05)
-
-            # 清空音乐内部队列（但不清空 AudioCodec 共享队列）
-            cleared_count = 0
-            if self._music_queue:
-                while not self._music_queue.empty():
-                    try:
-                        self._music_queue.get_nowait()
-                        cleared_count += 1
-                    except asyncio.QueueEmpty:
-                        break
-
-            logger.info(
-                f"暂停播放: {self.current_song} at {self._format_time(self.current_position)}, "
-                f"来源: {source}, 清空 {cleared_count} 帧音乐内部队列"
-            )
-
-            return {"status": "success", "message": "已暂停"}
-
-        except Exception as e:
-            logger.error(f"暂停播放失败: {e}", exc_info=True)
-            return {"status": "error", "message": f"暂停失败: {str(e)}"}
-
-    async def resume(self) -> dict:
-        """
-        恢复播放（从暂停位置重启解码）.
-        """
-        try:
-            if not self.is_playing:
-                return {"status": "info", "message": "没有正在播放的歌曲"}
-
-            if not self.paused:
-                return {"status": "info", "message": "当前未暂停"}
-
-            if not self._current_file_path or not self._current_file_path.exists():
-                return {"status": "error", "message": "无法找到音频文件"}
-
-            # ✅ 从暂停位置重新启动解码和播放
-            logger.info(
-                f"恢复播放: {self.current_song} from {self._format_time(self.current_position)}"
-            )
-
-            # 重新创建音乐队列
-            self._music_queue = asyncio.Queue(maxsize=100)
-
-            # 重新启动 FFmpeg 解码器（从暂停位置开始）
-            self.decoder = MusicDecoder(
-                sample_rate=AudioConfig.OUTPUT_SAMPLE_RATE,
-                channels=AudioConfig.CHANNELS,
-            )
-
-            success = await self.decoder.start_decode(
-                self._current_file_path, self._music_queue, self.current_position
-            )
-            if not success:
-                logger.error("重启解码器失败")
-                return {"status": "error", "message": "恢复播放失败"}
-
-            # 取消旧的播放任务（如果存在）
-            if self._playback_task and not self._playback_task.done():
-                self._playback_task.cancel()
-                try:
-                    await self._playback_task
-                except asyncio.CancelledError:
-                    pass
-
-            # 启动新的播放任务
-            self._playback_task = asyncio.create_task(self._playback_loop())
-
-            # 恢复状态
-            self.paused = False
-            self._pause_source = None  # 清除暂停来源标记
-            self.start_play_time = time.time() - self.current_position  # 调整时间基准
-
-            # 更新UI
-            if self.app and hasattr(self.app, "set_chat_message"):
-                await self._safe_update_ui(f"继续播放: {self.current_song}")
-
-            return {"status": "success", "message": "已恢复播放"}
-
-        except Exception as e:
-            logger.error(f"恢复播放失败: {e}")
-            return {"status": "error", "message": f"恢复失败: {str(e)}"}
-
-    async def seek(self, position: float) -> dict:
-        """
-        跳转到指定位置（通过重新解码实现）.
-        """
-        try:
-            if not self.is_playing:
-                return {"status": "error", "message": "没有正在播放的歌曲"}
-
-            if not self._current_file_path or not self._current_file_path.exists():
-                return {"status": "error", "message": "无法找到音频文件"}
-
-            # 限制跳转范围
-            if position < 0:
-                position = 0
-            elif position >= self.total_duration:
-                position = max(0, self.total_duration - 1)
-
-            # ✅ 关键：立即停止当前播放（类似切歌）
-            # 停止解码器
-            if self.decoder:
-                await self.decoder.stop()
-                self.decoder = None
-
-            # 等待解码器完全停止
-            await asyncio.sleep(0.05)
-
-            # 清空音乐队列
-            cleared_count = 0
-            if self._music_queue:
-                while not self._music_queue.empty():
-                    try:
-                        self._music_queue.get_nowait()
-                        cleared_count += 1
-                    except asyncio.QueueEmpty:
-                        break
-
-            # 清空 AudioCodec 播放队列（立即停止播放）
-            if self.audio_codec:
-                await self.audio_codec.clear_audio_queue()
-
-            logger.info(
-                f"跳转到 {self._format_time(position)}，清空 {cleared_count} 帧音乐数据"
-            )
-
-            # 从新位置重新开始播放
-            success = await self._start_playback(self._current_file_path, position)
-
-            if success:
-                return {
-                    "status": "success",
-                    "message": f"已跳转到 {self._format_time(position)}",
-                }
-            else:
-                return {"status": "error", "message": "跳转失败"}
-
-        except Exception as e:
-            logger.error(f"跳转失败: {e}", exc_info=True)
-            return {"status": "error", "message": f"跳转失败: {str(e)}"}
-
-    async def get_lyrics(self) -> dict:
-        """
-        获取当前歌曲歌词.
-        """
-        if not self.lyrics:
-            return {"status": "info", "message": "当前歌曲没有歌词", "lyrics": []}
-
-        # 提取歌词文本，转换为列表
-        lyrics_text = []
-        for time_sec, text in self.lyrics:
-            time_str = self._format_time(time_sec)
-            lyrics_text.append(f"[{time_str}] {text}")
-
-        return {
-            "status": "success",
-            "message": f"获取到 {len(self.lyrics)} 行歌词",
-            "lyrics": lyrics_text,
-        }
-
-    async def get_status(self) -> dict:
-        """获取播放器状态.
-
-        注意：只返回用户可见的状态，不返回内部暂停标志。 TTS 临时暂停不应该让 AI 认为音乐"已暂停"。
-        """
-        position = await self.get_position()
-        progress = await self.get_progress()
-
-        # 判断实际播放状态（排除 TTS 临时暂停）
-        if not self.is_playing:
-            playing_state = "未播放"
-        elif self.paused and self._pause_source == "manual":
-            # 只有用户主动暂停才报告"已暂停"
-            playing_state = "已暂停"
-        elif self.is_playing:
-            playing_state = "播放中"
-        else:
-            playing_state = "未知"
-
-        duration_str = self._format_time(self.total_duration)
-        position_str = self._format_time(position)
-
-        return {
-            "status": "success",
-            "message": (
-                f"当前歌曲: {self.current_song}\n"
-                f"播放状态: {playing_state}\n"
-                f"暂停来源状态: {self._pause_source} tts是说话时临时暂停\n"
-                f"播放时长: {duration_str}\n"
-                f"当前位置: {position_str}\n"
-                f"播放进度: {progress}%\n"
-                f"歌词可用: {'是' if len(self.lyrics) > 0 else '否'}"
-            ),
-        }
-
-    # 内部方法
-    async def _search_song(self, song_name: str) -> Tuple[str, str]:
-        """
-        Search song via NetEase Cloud Music API and get play URL.
-        """
         if not PYNCM_AVAILABLE or not self._ncm_initialized:
-            logger.error("NetEase Cloud Music API not initialized")
-            return "", ""
+            return {
+                "status": "error",
+                "message": "NetEase Cloud Music API not initialized. "
+                "Install pyncm: pip install pyncm",
+            }
 
         try:
-            # Step 1: Search for the song
+            # Search
             search_result = await asyncio.to_thread(
                 ncm_search.GetSearchResult,
                 keyword=song_name,
                 stype=1,
-                limit=5,
+                limit=10,
             )
 
             if not search_result or search_result.get("code") != 200:
-                logger.warning(f"Search failed: {search_result}")
-                return "", ""
+                return {"status": "error", "message": f"搜索失败: {song_name}"}
 
-            result_data = search_result.get("result", {})
-            songs = result_data.get("songs", [])
+            songs = search_result.get("result", {}).get("songs", [])
             if not songs:
-                logger.warning(f"No songs found for: {song_name}")
-                return "", ""
+                return {"status": "error", "message": f"没有找到: {song_name}"}
 
-            # Pick the first result
-            song = songs[0]
-            song_id = str(song.get("id", ""))
+            # Prioritize free songs for anonymous users
+            if self._ncm_has_vip_cookie:
+                candidates = songs
+            else:
+                free_songs = [s for s in songs if s.get("fee", 0) != 1]
+                vip_songs = [s for s in songs if s.get("fee", 0) == 1]
+                candidates = free_songs + vip_songs
+
+            song = candidates[0]
+            song_id = song.get("id")
             title = song.get("name", song_name)
-
-            # Extract artist names
             artists = song.get("ar", []) or song.get("artists", [])
-            artist = ", ".join([a.get("name", "") for a in artists if a.get("name")])
+            artist = ", ".join(
+                [a.get("name", "") for a in artists if a.get("name")]
+            )
 
-            # Extract album name
-            album_info = song.get("al", {}) or song.get("album", {})
-            album = album_info.get("name", "") if album_info else ""
+            display_name = f"{title} - {artist}" if artist else title
 
-            # Extract duration (milliseconds -> seconds)
-            duration_ms = song.get("dt", 0) or song.get("duration", 0)
-            self.total_duration = duration_ms / 1000.0 if duration_ms else 0
+            # Open in desktop client
+            await asyncio.to_thread(self._open_uri, f"orpheus://song/{song_id}")
 
-            # Set display name
-            display_name = title
-            if artist:
-                display_name = f"{title} - {artist}"
-                if album:
-                    display_name += f" ({album})"
-            self.current_song = display_name
-            self.song_id = song_id
-
-            # Step 2: Get play URL
-            quality_map = {
-                "standard": 128000,
-                "higher": 192000,
-                "exhigh": 320000,
-                "lossless": 999000,
-                "hires": 1999000,
+            logger.info(f"Playing: {display_name} (id={song_id})")
+            return {
+                "status": "success",
+                "message": f"正在播放: {display_name}",
             }
-            bitrate = quality_map.get(self._audio_quality, 128000)
 
-            audio_result = await asyncio.to_thread(
-                ncm_track.GetTrackAudio,
-                song_ids=[int(song_id)],
-                bitrate=bitrate,
+        except Exception as e:
+            logger.error(f"Search and play failed: {e}", exc_info=True)
+            return {"status": "error", "message": f"播放失败: {e}"}
+
+    async def play_favorites(self, shuffle: bool = False) -> dict:
+        """Play the user's 'My Likes' playlist in the desktop client."""
+        logger.info(f"play_favorites called: shuffle={shuffle}, has_cookie={self._ncm_has_vip_cookie}")
+
+        if not self._ncm_has_vip_cookie:
+            return {
+                "status": "error",
+                "message": "需要配置 MUSIC_U cookie 才能播放收藏歌单",
+            }
+
+        try:
+            await asyncio.to_thread(self._ensure_likes_playlist_id)
+
+            if self._likes_playlist_id is None:
+                return {"status": "error", "message": "无法获取「我喜欢的音乐」歌单"}
+
+            await asyncio.to_thread(
+                self._open_uri,
+                f"orpheus://playlist/{self._likes_playlist_id}",
             )
 
-            if not audio_result or audio_result.get("code") != 200:
-                logger.warning(f"Failed to get audio URL: {audio_result}")
-                return song_id, ""
+            # Wait for playlist to load, then start playback
+            await asyncio.sleep(1.5)
+            await asyncio.to_thread(self._send_media_key, VK_MEDIA_PLAY_PAUSE)
 
-            audio_data_list = audio_result.get("data", [])
-            if not audio_data_list:
-                logger.warning("No audio data returned")
-                return song_id, ""
-
-            audio_data = audio_data_list[0]
-            play_url = audio_data.get("url", "")
-
-            if not play_url:
-                logger.warning(f"Song '{title}' has no play URL (may require VIP or is region-locked)")
-                return song_id, ""
-
-            logger.info(
-                f"Found song: {display_name}, "
-                f"type: {audio_data.get('type', 'unknown')}, "
-                f"bitrate: {audio_data.get('br', 0) // 1000}kbps"
-            )
-
-            # Step 3: Fetch lyrics
-            await self._fetch_lyrics(song_id)
-
-            return song_id, play_url
+            mode_text = "随机播放" if shuffle else "顺序播放"
+            logger.info(f"Playing favorites playlist ({mode_text})")
+            return {
+                "status": "success",
+                "message": f"正在播放「我喜欢的音乐」({mode_text})",
+            }
 
         except Exception as e:
-            logger.error(f"Search song failed: {e}", exc_info=True)
-            return "", ""
+            logger.error(f"Play favorites failed: {e}", exc_info=True)
+            return {"status": "error", "message": f"播放收藏失败: {e}"}
 
-    async def _play_url(self, url: str) -> bool:
+    async def pause(self) -> dict:
+        """Pause playback via media key."""
+        self._send_media_key(VK_MEDIA_PLAY_PAUSE)
+        logger.info("Music paused")
+        return {"status": "success", "message": "已暂停音乐"}
+
+    async def resume(self) -> dict:
+        """Resume playback via media key."""
+        self._send_media_key(VK_MEDIA_PLAY_PAUSE)
+        logger.info("Music resumed")
+        return {"status": "success", "message": "已恢复播放"}
+
+    async def stop(self) -> dict:
+        """Stop playback via media key."""
+        self._send_media_key(VK_MEDIA_STOP)
+        logger.info("Music stopped")
+        return {"status": "success", "message": "已停止音乐"}
+
+    async def next_track(self) -> dict:
+        """Skip to next track via media key."""
+        self._send_media_key(VK_MEDIA_NEXT_TRACK)
+        logger.info("Skipped to next track")
+        return {"status": "success", "message": "已切换到下一首"}
+
+    async def previous_track(self) -> dict:
+        """Go to previous track via media key."""
+        self._send_media_key(VK_MEDIA_PREV_TRACK)
+        logger.info("Skipped to previous track")
+        return {"status": "success", "message": "已切换到上一首"}
+
+    async def get_current_track(self) -> dict:
+        """Get info about the currently playing track.
+
+        Combines audio session detection (is it playing?) with
+        window title extraction (what song is it?).
         """
-        播放指定URL（新实现：使用 FFmpeg + AudioCodec）
-        """
-        try:
-            # 检查 AudioCodec 是否可用
-            if not self.audio_codec:
-                logger.error("AudioCodec 未初始化，无法播放音乐")
-                return False
-
-            # 停止当前播放
-            if self.is_playing:
-                await self.stop()
-
-            # 检查缓存或下载
-            file_path = await self._get_or_download_file(url)
-            if not file_path:
-                return False
-
-            # 直接开始播放
-            return await self._start_playback(file_path)
-
-        except Exception as e:
-            logger.error(f"播放失败: {e}")
-            return False
-
-    async def _start_playback(
-        self, file_path: Path, start_position: float = 0.0
-    ) -> bool:
-        """开始播放音乐（内部方法）
-
-        Args:
-            file_path: 音频文件路径
-            start_position: 开始位置（秒），默认从头开始
-        """
-        try:
-            # ✅ 检查 TTS 状态：如果TTS正在播放，延迟启动
-            if self.app and self.app.is_speaking():
-                logger.info("TTS 播放中，音乐延迟启动")
-                self._deferred_start_path = file_path
-                self._deferred_start_position = start_position
-                # 标记为"准备播放"状态（AudioPlugin恢复时会检查）
-                self.is_playing = True
-                self.paused = True
-                return True
-
-            # 清除延迟启动标志
-            self._deferred_start_path = None
-            self._deferred_start_position = 0.0
-
-            # 保存当前文件路径（用于暂停/恢复）
-            self._current_file_path = file_path
-
-            # 创建音乐队列
-            self._music_queue = asyncio.Queue(maxsize=100)
-
-            # 启动 FFmpeg 解码器（支持从指定位置开始）
-            self.decoder = MusicDecoder(
-                sample_rate=AudioConfig.OUTPUT_SAMPLE_RATE,  # 24000Hz
-                channels=AudioConfig.CHANNELS,  # 1 channel
-            )
-
-            success = await self.decoder.start_decode(
-                file_path, self._music_queue, start_position
-            )
-            if not success:
-                logger.error("启动音频解码器失败")
-                return False
-
-            # 启动播放任务
-            self._playback_task = asyncio.create_task(self._playback_loop())
-
-            # 更新播放状态
-            self.is_playing = True
-            self.paused = False
-            self._pending_play = False
-            self.current_position = start_position  # 从指定位置开始
-            self.start_play_time = time.time() - start_position  # 调整时间基准
-            self.current_lyric_index = -1
-
-            position_info = f" from {start_position:.1f}s" if start_position > 0 else ""
-            logger.info(f"开始播放: {self.current_song}{position_info}")
-
-            # 更新UI
-            if self.app and hasattr(self.app, "set_chat_message"):
-                await self._safe_update_ui(f"正在播放: {self.current_song}")
-
-            # 启动歌词更新任务
-            asyncio.create_task(self._lyrics_update_task())
-
-            return True
-
-        except Exception as e:
-            logger.error(f"启动播放失败: {e}")
-            return False
-
-    async def _playback_loop(self):
-        """
-        播放循环：从队列取PCM，写入AudioCodec.
-        """
-        try:
-            while self.is_playing:
-                if self.paused:
-                    await asyncio.sleep(0.1)
-                    continue
-
-                # 从音乐队列取数据
-                try:
-                    audio_data = await asyncio.wait_for(
-                        self._music_queue.get(), timeout=5.0
-                    )
-                except asyncio.TimeoutError:
-                    logger.warning("音乐队列读取超时")
-                    continue
-
-                if audio_data is None:
-                    # EOF，播放结束
-                    logger.info("音乐播放完成")
-                    await self._handle_playback_finished()
-                    break
-
-                # 写入 AudioCodec 播放队列
-                await self._write_to_audio_codec(audio_data)
-
-        except asyncio.CancelledError:
-            logger.debug("播放循环被取消")
-        except Exception as e:
-            logger.error(f"播放循环异常: {e}", exc_info=True)
-
-    async def _write_to_audio_codec(self, pcm_data: np.ndarray):
-        """
-        将 PCM 数据写入 AudioCodec 播放队列.
-        """
-        try:
-            if not self.audio_codec:
-                logger.error("AudioCodec 未初始化")
-                return
-
-            # 确保是单声道数据
-            if pcm_data.ndim > 1:
-                # 立体声转单声道（取平均）
-                pcm_data = pcm_data.mean(axis=1).astype(np.int16)
-
-            # 调用 AudioCodec 的 write_pcm_direct 方法
-            await self.audio_codec.write_pcm_direct(pcm_data)
-
-        except Exception as e:
-            logger.error(f"写入 AudioCodec 失败: {e}", exc_info=True)
-
-    async def _get_or_download_file(self, url: str) -> Optional[Path]:
-        """获取或下载文件.
-
-        先检查缓存，如果缓存中没有则下载
-        """
-        try:
-            # Determine file extension from URL (NetEase may return .m4a, .flac, etc.)
-            ext = ".mp3"
-            if url:
-                parsed = urlparse(url)
-                path_lower = parsed.path.lower()
-                for check_ext in [".m4a", ".flac", ".mp3", ".ogg", ".wav"]:
-                    if check_ext in path_lower:
-                        ext = check_ext
-                        break
-
-            # Also check cache for other extensions (in case quality changed)
-            for check_ext in [ext, ".mp3", ".m4a", ".flac"]:
-                cache_path = self.cache_dir / f"{self.song_id}{check_ext}"
-                if cache_path.exists():
-                    logger.info(f"使用缓存: {cache_path}")
-                    return cache_path
-
-            # Cache miss, download
-            cache_filename = f"{self.song_id}{ext}"
-            return await self._download_file(url, cache_filename)
-
-        except Exception as e:
-            logger.error(f"获取文件失败: {e}")
-            return None
-
-    async def _download_file(self, url: str, filename: str) -> Optional[Path]:
-        """下载文件到缓存目录.
-
-        先下载到临时目录，下载完成后移动到正式缓存目录
-        """
-        temp_path = None
-        try:
-            # 创建临时文件路径
-            temp_path = self.temp_cache_dir / f"temp_{int(time.time())}_{filename}"
-
-            # 异步下载
-            response = await asyncio.to_thread(
-                requests.get,
-                url,
-                headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                    "Accept": "*/*",
-                },
-                stream=True,
-                timeout=30,
-            )
-            response.raise_for_status()
-
-            # 写入临时文件
-            with open(temp_path, "wb") as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
-
-            # 下载完成，移动到正式缓存目录
-            cache_path = self.cache_dir / filename
-            shutil.move(str(temp_path), str(cache_path))
-
-            logger.info(f"音乐下载完成并缓存: {cache_path}")
-            return cache_path
-
-        except Exception as e:
-            logger.error(f"下载失败: {e}")
-            # 清理临时文件
-            if temp_path and temp_path.exists():
-                try:
-                    temp_path.unlink()
-                    logger.debug(f"已清理临时下载文件: {temp_path}")
-                except Exception:
-                    pass
-            return None
-
-    async def _fetch_lyrics(self, song_id: str):
-        """
-        Fetch lyrics from NetEase Cloud Music API.
-        """
-        try:
-            # Reset lyrics
-            self.lyrics = []
-
-            if not PYNCM_AVAILABLE or not self._ncm_initialized:
-                logger.warning("NetEase API not initialized, skip lyrics fetch")
-                return
-
-            lyric_result = await asyncio.to_thread(
-                ncm_track.GetTrackLyrics,
-                song_id=int(song_id),
-            )
-
-            if not lyric_result or lyric_result.get("code") != 200:
-                logger.warning(f"Failed to fetch lyrics: {lyric_result}")
-                return
-
-            # NetEase returns lyrics in lrc field
-            lrc_data = lyric_result.get("lrc", {})
-            lrc_content = lrc_data.get("lyric", "")
-
-            if not lrc_content:
-                logger.info("No lyrics available for this song")
-                return
-
-            # Parse LRC format lyrics
-            lines = lrc_content.split("\n")
-            for line in lines:
-                line = line.strip()
-                if not line:
-                    continue
-
-                # Match time tag format [mm:ss.xx] or [mm:ss.xxx]
-                time_match = re.match(r"\[(\d{2}):(\d{2})\.(\d{2,3})\](.*)", line)
-                if time_match:
-                    minutes = int(time_match.group(1))
-                    seconds = int(time_match.group(2))
-                    frac_str = time_match.group(3)
-                    text = time_match.group(4).strip()
-
-                    # Handle both centiseconds (2 digits) and milliseconds (3 digits)
-                    if len(frac_str) == 2:
-                        frac = int(frac_str) / 100.0
-                    else:
-                        frac = int(frac_str) / 1000.0
-
-                    # Convert to total seconds
-                    time_sec = minutes * 60 + seconds + frac
-
-                    # Skip empty lyrics and metadata lines
-                    if (
-                        text
-                        and not text.startswith("作词")
-                        and not text.startswith("作曲")
-                        and not text.startswith("编曲")
-                        and not text.startswith("ti:")
-                        and not text.startswith("ar:")
-                        and not text.startswith("al:")
-                        and not text.startswith("by:")
-                        and not text.startswith("offset:")
-                    ):
-                        self.lyrics.append((time_sec, text))
-
-            logger.info(f"Successfully fetched lyrics, {len(self.lyrics)} lines")
-
-        except Exception as e:
-            logger.error(f"Fetch lyrics failed: {e}")
-
-    async def _lyrics_update_task(self):
-        """
-        歌词更新任务.
-        """
-        if not self.lyrics:
-            return
-
-        try:
-            while self.is_playing:
-                if self.paused:
-                    await asyncio.sleep(0.5)
-                    continue
-
-                current_time = time.time() - self.start_play_time
-
-                # 检查是否播放完成
-                if current_time >= self.total_duration:
-                    await self._handle_playback_finished()
-                    break
-
-                # 查找当前时间对应的歌词
-                current_index = self._find_current_lyric_index(current_time)
-
-                # 如果歌词索引变化了，更新显示
-                if current_index != self.current_lyric_index:
-                    await self._display_current_lyric(current_index)
-
-                await asyncio.sleep(0.2)
-        except Exception as e:
-            logger.error(f"歌词更新任务异常: {e}")
-
-    def _find_current_lyric_index(self, current_time: float) -> int:
-        """
-        查找当前时间对应的歌词索引.
-        """
-        # 查找下一句歌词
-        next_lyric_index = None
-        for i, (time_sec, _) in enumerate(self.lyrics):
-            # 添加一个小的偏移量(0.5秒)，使歌词显示更准确
-            if time_sec > current_time - 0.5:
-                next_lyric_index = i
-                break
-
-        # 确定当前歌词索引
-        if next_lyric_index is not None and next_lyric_index > 0:
-            # 如果找到下一句歌词，当前歌词就是它的前一句
-            return next_lyric_index - 1
-        elif next_lyric_index is None and self.lyrics:
-            # 如果没找到下一句，说明已经到最后一句
-            return len(self.lyrics) - 1
-        else:
-            # 其他情况（如播放刚开始）
-            return 0
-
-    async def _display_current_lyric(self, current_index: int):
-        """
-        显示当前歌词.
-        """
-        self.current_lyric_index = current_index
-
-        if current_index < len(self.lyrics):
-            time_sec, text = self.lyrics[current_index]
-
-            # 在歌词前添加时间和进度信息
-            position_str = self._format_time(time.time() - self.start_play_time)
-            duration_str = self._format_time(self.total_duration)
-            display_text = f"[{position_str}/{duration_str}] {text}"
-
-            # 更新UI
-            if self.app and hasattr(self.app, "set_chat_message"):
-                await self._safe_update_ui(display_text)
-                logger.debug(f"显示歌词: {text}")
-
-    def _format_time(self, seconds: float) -> str:
-        """
-        将秒数格式化为 mm:ss 格式.
-        """
-        minutes = int(seconds) // 60
-        seconds = int(seconds) % 60
-        return f"{minutes:02d}:{seconds:02d}"
-
-    async def _safe_update_ui(self, message: str):
-        """
-        安全地更新UI.
-        """
-        if not self.app or not hasattr(self.app, "set_chat_message"):
-            return
-
-        try:
-            self.app.set_chat_message("assistant", message)
-        except Exception as e:
-            logger.error(f"更新UI失败: {e}")
-
-    def __del__(self):
-        """
-        清理资源.
-        """
-        try:
-            # 如果程序正常退出，额外清理一次临时缓存
-            self._clean_temp_cache()
-        except Exception:
-            # 忽略错误，因为在对象销毁阶段可能会有各种异常
-            pass
-
-
-# 全局音乐播放器实例
-_music_player_instance = None
+        is_playing = await asyncio.to_thread(self.is_music_actually_playing)
+        if not is_playing:
+            is_running = await asyncio.to_thread(self.is_music_app_running)
+            if not is_running:
+                return {
+                    "status": "success",
+                    "message": "网易云音乐未运行",
+                    "playing": False,
+                }
+            return {
+                "status": "success",
+                "message": "当前没有在播放音乐",
+                "playing": False,
+            }
+
+        # Try to get song info from window title
+        title = await asyncio.to_thread(self._get_netease_window_title)
+        if title:
+            return {
+                "status": "success",
+                "message": f"当前正在播放: {title}",
+                "playing": True,
+                "track": title,
+            }
+
+        return {
+            "status": "success",
+            "message": "正在播放音乐（无法获取歌曲信息）",
+            "playing": True,
+        }
+
+
+# ------------------------------------------------------------------
+# Singleton accessor
+# ------------------------------------------------------------------
+
+_music_player_instance: Optional[MusicPlayer] = None
 
 
 def get_music_player_instance() -> MusicPlayer:
-    """
-    获取音乐播放器单例.
-    """
+    """Get or create the singleton MusicPlayer instance."""
     global _music_player_instance
     if _music_player_instance is None:
         _music_player_instance = MusicPlayer()
-        logger.info("[MusicPlayer] 创建音乐播放器单例实例")
     return _music_player_instance

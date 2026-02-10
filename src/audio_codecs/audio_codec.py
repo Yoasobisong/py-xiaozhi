@@ -322,42 +322,50 @@ class AudioCodec:
     async def _create_streams(self):
         """
         创建音频流（完全使用设备原生格式）
+
+        InputStream (microphone) failure is non-fatal: TTS playback still works
+        via OutputStream alone. Only OutputStream failure is fatal.
         """
+        # Input stream: optional (microphone may be unavailable)
         try:
-            # 输入流：使用设备原生采样率和声道数
             self.input_stream = sd.InputStream(
                 device=self.mic_device_id,
-                samplerate=self.device_input_sample_rate,  # 设备原生采样率
-                channels=self.input_channels,  # 设备原生声道数
+                samplerate=self.device_input_sample_rate,
+                channels=self.input_channels,
                 dtype=np.float32,
-                blocksize=self._device_input_frame_size,  # 设备原生帧大小
+                blocksize=self._device_input_frame_size,
                 callback=self._input_callback,
                 finished_callback=self._input_finished_callback,
                 latency="low",
             )
+            self.input_stream.start()
+            logger.info(
+                f"输入流已启动 | {self.device_input_sample_rate}Hz {self.input_channels}ch"
+            )
+        except Exception as e:
+            logger.warning(
+                f"麦克风不可用，语音输入已禁用（TTS播放不受影响）: {e}"
+            )
+            self.input_stream = None
 
-            # 输出流：使用设备原生采样率和声道数
+        # Output stream: required (TTS playback depends on this)
+        try:
             self.output_stream = sd.OutputStream(
                 device=self.speaker_device_id,
-                samplerate=self.device_output_sample_rate,  # 设备原生采样率
-                channels=self.output_channels,  # 设备原生声道数
+                samplerate=self.device_output_sample_rate,
+                channels=self.output_channels,
                 dtype=np.float32,
-                blocksize=self._device_output_frame_size,  # 设备原生帧大小
+                blocksize=self._device_output_frame_size,
                 callback=self._output_callback,
                 finished_callback=self._output_finished_callback,
                 latency="low",
             )
-
-            self.input_stream.start()
             self.output_stream.start()
-
             logger.info(
-                f"音频流已启动 | 输入: {self.device_input_sample_rate}Hz {self.input_channels}ch | "
-                f"输出: {self.device_output_sample_rate}Hz {self.output_channels}ch"
+                f"输出流已启动 | {self.device_output_sample_rate}Hz {self.output_channels}ch"
             )
-
         except Exception as e:
-            logger.error(f"创建音频流失败: {e}")
+            logger.error(f"创建输出音频流失败: {e}")
             raise
 
     def _input_callback(self, indata, frames, time_info, status):
