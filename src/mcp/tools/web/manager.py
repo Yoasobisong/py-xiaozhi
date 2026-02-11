@@ -7,7 +7,7 @@ from typing import Any, Dict
 
 from src.utils.logging_config import get_logger
 
-from .tools import open_url, search_web
+from .tools import open_url, search_web, fetch_content
 
 logger = get_logger(__name__)
 
@@ -77,6 +77,28 @@ class WebToolsManager:
                 )
             )
 
+            # Fetch content tool
+            fetch_props = PropertyList(
+                [Property("url", PropertyType.STRING)]
+            )
+            add_tool(
+                (
+                    "web.fetch_content",
+                    "Fetch and extract main text content from a web page URL.\n"
+                    "Use when user says: '帮我看看这个网页写了什么', '抓取这个链接的内容', "
+                    "'读取网页内容', '总结这个网页', '这个链接说了什么', "
+                    "'fetch this url', 'read this page', 'summarize this link'.\n"
+                    "Parameter:\n"
+                    "- url: The URL to fetch (e.g. 'https://example.com/article')\n"
+                    "Returns the page title and main text content "
+                    "(cleaned, no ads/navigation).\n"
+                    "The AI can then summarize, translate, or extract info "
+                    "from the returned text.",
+                    fetch_props,
+                    fetch_content,
+                )
+            )
+
             self._initialized = True
             logger.info("[WebManager] Web tools registered successfully")
 
@@ -91,8 +113,8 @@ class WebToolsManager:
     def get_status(self) -> Dict[str, Any]:
         return {
             "initialized": self._initialized,
-            "tools_count": 2,
-            "available_tools": ["open_url", "search"],
+            "tools_count": 3,
+            "available_tools": ["open_url", "search", "fetch_content"],
         }
 
 

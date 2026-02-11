@@ -47,9 +47,10 @@
 | **网络** | `network.ping` | Ping 主机测试连通性和延迟 | "ping一下百度" |
 | **网络** | `network.speedtest` | 简单下载测速 | "测一下网速" |
 | **网络** | `network.get_ip` | 获取局域网 IP 和公网 IP | "我的IP是多少" |
+| **网页** | `web.fetch_content` | 抓取网页正文内容（去广告/导航） | "帮我看看这个链接写了什么" |
 | **命理** | `self.bazi.*` | 八字命理分析（6个工具） | "帮我算一下八字" |
 
-> 共 **48 个** MCP 工具已注册
+> 共 **49 个** MCP 工具已注册
 
 ---
 
@@ -215,7 +216,7 @@ Phase 4 (高级功能):
 |--------|------|------|
 | **M1** | ~~剪贴板图片→视觉分析~~ | ✅ 已完成 (`clipboard.analyze_image`) |
 | **M2** | ~~网络工具~~ | ✅ 已完成 (`network.ping`, `network.speedtest`, `network.get_ip`) |
-| **M3** | 网页内容抓取框架 | 用 requests+BeautifulSoup 抓取网页正文，为后续工具铺路 |
+| **M3** | ~~网页内容抓取框架~~ | ✅ 已完成 (`web.fetch_content`) |
 | **M4** | 进程管理增强 | CPU/内存 top 进程、按关键词过滤 |
 | **L1** | GitHub Trending 周报 | 抓取热门项目生成摘要（依赖 M3） |
 | **L2** | B站热门周报 | 抓取B站热门/每周必看（依赖 M3） |
