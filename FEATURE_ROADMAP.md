@@ -43,9 +43,10 @@
 | **网页** | `web.search` | 用Chrome搜索（支持Google/百度/Bing/GitHub/B站/知乎） | "帮我搜Python教程" |
 | **剪贴板** | `clipboard.read_text` | 读取剪贴板文本（自动翻译：中→英，非中→中） | "翻译剪贴板内容" |
 | **剪贴板** | `clipboard.write_text` | 写入文本到剪贴板 | "把翻译结果复制到剪贴板" |
+| **剪贴板** | `clipboard.analyze_image` | 分析剪贴板中的图片（OCR/翻译/代码解读） | "分析剪贴板图片" |
 | **命理** | `self.bazi.*` | 八字命理分析（6个工具） | "帮我算一下八字" |
 
-> 共 **44 个** MCP 工具已注册
+> 共 **45 个** MCP 工具已注册
 
 ---
 
@@ -193,3 +194,29 @@ Phase 4 (高级功能):
 - 工具描述使用英文，支持中英文用户指令
 - 每个工具需在 `src/mcp/mcp_server.py` 中注册
 - 网页内容抓取相关功能（L1-L4）依赖 M3 框架先完成
+
+---
+
+## 待解决问题
+
+| 功能 | 状态 | 问题 | 下一步 |
+|------|------|------|--------|
+| `music_player.search_and_play` | WIP | orpheus URI 打开歌曲页不自动播放，PostMessage Space 键对 CEF 应用无效 | 用 pywinauto `set_focus()` + `type_keys("{VK_SPACE}")` 替换（已安装 pywinauto） |
+| `music_player.play_favorites` | WIP | orpheus `?autoplay=1` 参数无效，同上播放触发问题 | 同上，pywinauto 方案 |
+
+---
+
+## 待实现功能优先级速查
+
+| 优先级 | 功能 | 说明 |
+|--------|------|------|
+| **M1** | ~~剪贴板图片→视觉分析~~ | ✅ 已完成 (`clipboard.analyze_image`) |
+| **M2** | 网络工具 | Ping、测速、获取本机 IP |
+| **M3** | 网页内容抓取框架 | 用 requests+BeautifulSoup 抓取网页正文，为后续工具铺路 |
+| **M4** | 进程管理增强 | CPU/内存 top 进程、按关键词过滤 |
+| **L1** | GitHub Trending 周报 | 抓取热门项目生成摘要（依赖 M3） |
+| **L2** | B站热门周报 | 抓取B站热门/每周必看（依赖 M3） |
+| **L3** | ArXiv 论文每日推荐 | 自动化/机器人/CV 方向论文推荐（依赖 M3） |
+| **L4** | Hacker News 热门摘要 | HN top 10 中文摘要（依赖 M3） |
+| **L5** | 组合工作流/快捷指令 | 多工具组合执行，如"开始工作"→打开应用+调音量 |
+| **L6** | Notion 集成 | 语音口述保存到 Notion 笔记 |

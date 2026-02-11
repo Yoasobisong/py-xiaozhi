@@ -1,13 +1,13 @@
 """Clipboard tools manager.
 
-Registers clipboard MCP tools (read/write text).
+Registers clipboard MCP tools (read/write text, analyze image).
 """
 
 from typing import Any, Dict
 
 from src.utils.logging_config import get_logger
 
-from .tools import read_clipboard, write_clipboard
+from .tools import read_clipboard, write_clipboard, analyze_clipboard_image
 
 logger = get_logger(__name__)
 
@@ -71,6 +71,29 @@ class ClipboardToolsManager:
                 )
             )
 
+            # Analyze clipboard image
+            analyze_props = PropertyList(
+                [Property("question", PropertyType.STRING, default_value="")]
+            )
+            add_tool(
+                (
+                    "clipboard.analyze_image",
+                    "Analyze an image from the system clipboard using AI vision.\n"
+                    "Use when user says: '分析剪贴板图片', '看看我截的图', '剪贴板里的图片是什么', "
+                    "'识别剪贴板图片', '帮我看看复制的图', 'OCR剪贴板', '翻译截图', "
+                    "'analyze clipboard image', 'what is in my clipboard image'.\n"
+                    "Supports: Win+Shift+S screenshots, copied images, "
+                    "image files copied from Explorer.\n"
+                    "Parameter:\n"
+                    "- question: (optional) Specific question about the image. "
+                    "If empty, describes the image content.\n"
+                    "Use cases: OCR text extraction, translate text in image, "
+                    "analyze code screenshots, identify objects, read error messages.",
+                    analyze_props,
+                    analyze_clipboard_image,
+                )
+            )
+
             self._initialized = True
             logger.info("[ClipboardManager] Clipboard tools registered successfully")
 
@@ -87,8 +110,8 @@ class ClipboardToolsManager:
     def get_status(self) -> Dict[str, Any]:
         return {
             "initialized": self._initialized,
-            "tools_count": 2,
-            "available_tools": ["read_text", "write_text"],
+            "tools_count": 3,
+            "available_tools": ["read_text", "write_text", "analyze_image"],
         }
 
 
