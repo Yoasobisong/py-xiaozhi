@@ -44,9 +44,12 @@
 | **剪贴板** | `clipboard.read_text` | 读取剪贴板文本（自动翻译：中→英，非中→中） | "翻译剪贴板内容" |
 | **剪贴板** | `clipboard.write_text` | 写入文本到剪贴板 | "把翻译结果复制到剪贴板" |
 | **剪贴板** | `clipboard.analyze_image` | 分析剪贴板中的图片（OCR/翻译/代码解读） | "分析剪贴板图片" |
+| **网络** | `network.ping` | Ping 主机测试连通性和延迟 | "ping一下百度" |
+| **网络** | `network.speedtest` | 简单下载测速 | "测一下网速" |
+| **网络** | `network.get_ip` | 获取局域网 IP 和公网 IP | "我的IP是多少" |
 | **命理** | `self.bazi.*` | 八字命理分析（6个工具） | "帮我算一下八字" |
 
-> 共 **45 个** MCP 工具已注册
+> 共 **48 个** MCP 工具已注册
 
 ---
 
@@ -211,7 +214,7 @@ Phase 4 (高级功能):
 | 优先级 | 功能 | 说明 |
 |--------|------|------|
 | **M1** | ~~剪贴板图片→视觉分析~~ | ✅ 已完成 (`clipboard.analyze_image`) |
-| **M2** | 网络工具 | Ping、测速、获取本机 IP |
+| **M2** | ~~网络工具~~ | ✅ 已完成 (`network.ping`, `network.speedtest`, `network.get_ip`) |
 | **M3** | 网页内容抓取框架 | 用 requests+BeautifulSoup 抓取网页正文，为后续工具铺路 |
 | **M4** | 进程管理增强 | CPU/内存 top 进程、按关键词过滤 |
 | **L1** | GitHub Trending 周报 | 抓取热门项目生成摘要（依赖 M3） |

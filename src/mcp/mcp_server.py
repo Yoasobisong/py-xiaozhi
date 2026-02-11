@@ -365,6 +365,12 @@ class McpServer:
         clipboard_manager = get_clipboard_tools_manager()
         clipboard_manager.init_tools(self.add_tool, PropertyList, Property, PropertyType)
 
+        # 添加网络工具
+        from src.mcp.tools.network import get_network_tools_manager
+
+        network_manager = get_network_tools_manager()
+        network_manager.init_tools(self.add_tool, PropertyList, Property, PropertyType)
+
         # 恢复原有工具
         self.tools.extend(original_tools)
 
