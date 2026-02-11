@@ -13,6 +13,7 @@ from .app_management.scanner import scan_installed_applications
 from .tools import (
     cancel_shutdown,
     get_brightness,
+    get_top_processes,
     get_volume,
     lock_screen,
     restart_system,
@@ -76,6 +77,11 @@ class SystemToolsManager:
 
             # 注册亮度控制工具
             self._register_brightness_tools(
+                add_tool, PropertyList, Property, PropertyType
+            )
+
+            # 注册进程资源监控工具
+            self._register_top_processes_tool(
                 add_tool, PropertyList, Property, PropertyType
             )
 
@@ -382,6 +388,39 @@ class SystemToolsManager:
         )
         logger.debug("[SystemManager] 注册亮度控制工具成功")
 
+    def _register_top_processes_tool(
+        self, add_tool, PropertyList, Property, PropertyType
+    ):
+        """
+        Register system resource monitoring tool (top processes).
+        """
+        top_props = PropertyList(
+            [
+                Property("sort_by", PropertyType.STRING, default_value="cpu"),
+                Property("count", PropertyType.INTEGER, default_value=10,
+                         min_value=1, max_value=50),
+                Property("filter_name", PropertyType.STRING, default_value=""),
+            ]
+        )
+        add_tool(
+            (
+                "system.top_processes",
+                "查看系统资源占用最高的进程。\n"
+                "Use when user says: '什么在占CPU', '内存占用', '哪个进程最耗资源', "
+                "'电脑怎么这么卡', '卡顿', '系统资源', 'top processes', "
+                "'what is using CPU/memory', 'why is my computer slow'.\n"
+                "Parameters:\n"
+                "- sort_by: 'cpu' or 'memory' (default: 'cpu')\n"
+                "- count: Number of processes to return (1-50, default: 10)\n"
+                "- filter_name: Optional keyword to filter process names\n\n"
+                "Returns system summary (total CPU/memory usage) and top N processes "
+                "with CPU%, memory%, memory_mb for each.",
+                top_props,
+                get_top_processes,
+            )
+        )
+        logger.debug("[SystemManager] 注册进程资源监控工具成功")
+
     def is_initialized(self) -> bool:
         """
         检查管理器是否已初始化.
@@ -399,6 +438,7 @@ class SystemToolsManager:
             "scan_installed_applications",
             "kill_application",
             "list_running_applications",
+            "top_processes",
         ]
         return {
             "initialized": self._initialized,

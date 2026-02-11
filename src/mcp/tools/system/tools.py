@@ -4,9 +4,12 @@
 """
 
 import asyncio
+import json
 import subprocess
 import sys
 from typing import Any, Dict
+
+import psutil
 
 from src.utils.logging_config import get_logger
 
@@ -356,4 +359,89 @@ async def get_brightness(args: Dict[str, Any]) -> str:
     except Exception as e:
         logger.error(f"[SystemTools] Get brightness failed: {e}", exc_info=True)
         return f"Get brightness failed: {e}"
+
+
+async def get_top_processes(args: Dict[str, Any]) -> str:
+    """
+    Get top processes sorted by CPU or memory usage.
+    """
+    sort_by = args.get("sort_by", "cpu")
+    count = args.get("count", 10)
+    filter_name = args.get("filter_name", "")
+
+    try:
+        logger.info(
+            f"[SystemTools] Getting top {count} processes by {sort_by}"
+            f"{f', filter={filter_name}' if filter_name else ''}"
+        )
+
+        def _get_top_sync():
+            procs = []
+            for p in psutil.process_iter(
+                ["pid", "name", "cpu_percent", "memory_percent",
+                 "memory_info", "status"]
+            ):
+                try:
+                    info = p.info
+                    # Skip system idle process (PID 0)
+                    if info["pid"] == 0:
+                        continue
+                    # Optional keyword filter
+                    if filter_name and filter_name.lower() not in (info["name"] or "").lower():
+                        continue
+                    procs.append({
+                        "pid": info["pid"],
+                        "name": info["name"] or "unknown",
+                        "cpu_percent": info["cpu_percent"] or 0.0,
+                        "memory_percent": round(info["memory_percent"] or 0.0, 1),
+                        "memory_mb": round(
+                            info["memory_info"].rss / 1024 / 1024, 1
+                        ) if info.get("memory_info") else 0,
+                        "status": info["status"] or "unknown",
+                    })
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+
+            # Sort by chosen metric
+            key = "cpu_percent" if sort_by == "cpu" else "memory_percent"
+            procs.sort(key=lambda x: x[key], reverse=True)
+            return procs[:count]
+
+        # cpu_percent needs an initial call to start measurement
+        for p in psutil.process_iter(["cpu_percent"]):
+            pass
+        await asyncio.sleep(0.5)
+
+        results = await asyncio.to_thread(_get_top_sync)
+
+        # System summary
+        vm = psutil.virtual_memory()
+        summary = {
+            "cpu_usage_total": psutil.cpu_percent(interval=None),
+            "memory_total_gb": round(vm.total / 1024**3, 1),
+            "memory_used_gb": round(vm.used / 1024**3, 1),
+            "memory_percent": vm.percent,
+        }
+
+        logger.info(
+            f"[SystemTools] Top processes: {len(results)} results, "
+            f"CPU total={summary['cpu_usage_total']}%, "
+            f"MEM={summary['memory_percent']}%"
+        )
+
+        return json.dumps({
+            "success": True,
+            "sort_by": sort_by,
+            "count": len(results),
+            "filter": filter_name or None,
+            "system_summary": summary,
+            "processes": results,
+        }, ensure_ascii=False)
+
+    except Exception as e:
+        logger.error(f"[SystemTools] Get top processes failed: {e}", exc_info=True)
+        return json.dumps(
+            {"success": False, "message": f"获取进程信息失败: {e}"},
+            ensure_ascii=False,
+        )
 

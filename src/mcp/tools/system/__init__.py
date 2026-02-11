@@ -7,6 +7,7 @@ from .manager import SystemToolsManager, get_system_tools_manager
 from .tools import (
     cancel_shutdown,
     get_brightness,
+    get_top_processes,
     get_volume,
     lock_screen,
     restart_system,
@@ -28,4 +29,5 @@ __all__ = [
     "cancel_shutdown",
     "set_brightness",
     "get_brightness",
+    "get_top_processes",
 ]
