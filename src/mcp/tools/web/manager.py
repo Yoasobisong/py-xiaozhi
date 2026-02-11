@@ -8,6 +8,7 @@ from typing import Any, Dict
 from src.utils.logging_config import get_logger
 
 from .tools import open_url, search_web, fetch_content
+from .sources import github_trending
 
 logger = get_logger(__name__)
 
@@ -99,6 +100,32 @@ class WebToolsManager:
                 )
             )
 
+            # GitHub Trending tool
+            trending_props = PropertyList(
+                [
+                    Property("language", PropertyType.STRING, default_value=""),
+                    Property("since", PropertyType.STRING, default_value="weekly"),
+                ]
+            )
+            add_tool(
+                (
+                    "web.github_trending",
+                    "获取 GitHub Trending 热门项目列表。\n"
+                    "Use when user says: 'GitHub上有什么热门项目', '最近流行什么开源项目', "
+                    "'GitHub trending', 'GitHub这周有什么火的', '推荐一些开源项目', "
+                    "'有什么好的开源项目'.\n"
+                    "Parameters:\n"
+                    "- language: Programming language filter "
+                    "(e.g. 'python', 'rust', 'javascript', empty for all)\n"
+                    "- since: Time range - 'daily', 'weekly', or 'monthly' "
+                    "(default: 'weekly')\n\n"
+                    "Returns list of trending repos with name, description, "
+                    "language, stars, forks, and growth.",
+                    trending_props,
+                    github_trending,
+                )
+            )
+
             self._initialized = True
             logger.info("[WebManager] Web tools registered successfully")
 
@@ -113,8 +140,8 @@ class WebToolsManager:
     def get_status(self) -> Dict[str, Any]:
         return {
             "initialized": self._initialized,
-            "tools_count": 3,
-            "available_tools": ["open_url", "search", "fetch_content"],
+            "tools_count": 4,
+            "available_tools": ["open_url", "search", "fetch_content", "github_trending"],
         }
 
 

@@ -49,9 +49,10 @@
 | **网络** | `network.get_ip` | 获取局域网 IP 和公网 IP | "我的IP是多少" |
 | **网页** | `web.fetch_content` | 抓取网页正文内容（去广告/导航） | "帮我看看这个链接写了什么" |
 | **系统** | `system.top_processes` | 查看 CPU/内存占用 top 进程（支持关键词过滤） | "什么在占CPU" |
+| **内容** | `web.github_trending` | 获取 GitHub Trending 热门项目（支持语言/时间过滤） | "GitHub这周有什么火的" |
 | **命理** | `self.bazi.*` | 八字命理分析（6个工具） | "帮我算一下八字" |
 
-> 共 **50 个** MCP 工具已注册
+> 共 **51 个** MCP 工具已注册
 
 ---
 
@@ -219,7 +220,7 @@ Phase 4 (高级功能):
 | **M2** | ~~网络工具~~ | ✅ 已完成 (`network.ping`, `network.speedtest`, `network.get_ip`) |
 | **M3** | ~~网页内容抓取框架~~ | ✅ 已完成 (`web.fetch_content`) |
 | **M4** | ~~进程管理增强~~ | ✅ 已完成 (`system.top_processes`) |
-| **L1** | GitHub Trending 周报 | 抓取热门项目生成摘要（依赖 M3） |
+| **L1** | ~~GitHub Trending 周报~~ | ✅ 已完成 (`web.github_trending`) |
 | **L2** | B站热门周报 | 抓取B站热门/每周必看（依赖 M3） |
 | **L3** | ArXiv 论文每日推荐 | 自动化/机器人/CV 方向论文推荐（依赖 M3） |
 | **L4** | Hacker News 热门摘要 | HN top 10 中文摘要（依赖 M3） |
